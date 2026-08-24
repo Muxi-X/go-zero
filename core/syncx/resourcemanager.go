@@ -75,3 +75,19 @@ func (manager *ResourceManager) Inject(key string, resource io.Closer) {
 	manager.resources[key] = resource
 	manager.lock.Unlock()
 }
+
+// RemoveResource removes the resource associated with given key.
+func (manager *ResourceManager) RemoveResource(key string) error {
+	manager.lock.Lock()
+	resource, ok := manager.resources[key]
+	if ok {
+		delete(manager.resources, key)
+	}
+	manager.lock.Unlock()
+
+	if !ok {
+		return nil
+	}
+
+	return resource.Close()
+}

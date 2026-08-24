@@ -8,7 +8,12 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ## 补丁
 
-`core/discov/internal/registry.go`（以 `[Muxi Patch]` 标记）：`watch()` 失败后 1s cooldown + 关闭旧 client、重建新 client 重新认证（对应 etcd 官方 workaround）。
+以 `[Muxi Patch]` 标记，三个文件：
+- `core/syncx/resourcemanager.go`：新增 `RemoveResource`（移除并关闭单个缓存资源）
+- `core/discov/internal/registry.go`：新增 `InvalidateConn`；`watch()` 失败后移除缓存 client，下次 `getClient()` 惰性创建新 client 重新认证
+- `core/discov/publisher.go`：keepalive 关闭时同样失效缓存 client
+
+思路对齐上游 PR #5709：**惰性失效 + 单飞重建**（不主动重建，避免并发/泄漏问题）。
 
 ## 使用
 

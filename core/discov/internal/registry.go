@@ -41,6 +41,11 @@ func (r *Registry) GetConn(endpoints []string) (EtcdClient, error) {
 	return c.getClient()
 }
 
+// InvalidateConn removes the cached etcd client associated with given endpoints.
+func (r *Registry) InvalidateConn(endpoints []string) error {
+	return connManager.RemoveResource(getClusterKey(endpoints))
+}
+
 // Monitor monitors the key on given etcd endpoints, notify with the given UpdateListener.
 func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener) error {
 	c, exists := r.getCluster(endpoints)
@@ -291,6 +296,39 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		if c.watchStream(cli, key, rev) {
 			return
 		}
+
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		// [Muxi Patch]
+		// clientv3 does not refresh the auth token on watch streams (#12385),
+		// so a long-lived watch fails with "invalid auth token" once the token
+		// expires. Remove the cached client so the next getClient() lazily
+		// creates a fresh one (with a new token). Single-flight guarantees
+		// only one client is recreated even when multiple watchers fail
+		// together. Retry with a cooldown to avoid a tight loop.
+		logx.Errorf("etcd monitor chan exited, invalidate client and retry in %v", coolDownInterval)
+		if err := connManager.RemoveResource(c.key); err != nil {
+			logx.Errorf("remove etcd client resource: %v", err)
+		}
+		time.Sleep(coolDownInterval)
+
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		newCli, err := c.getClient()
+		if err != nil {
+			logx.Errorf("recreate etcd client: %v", err)
+			continue
+		}
+		cli = newCli
+		rev = c.load(cli, key)
 	}
 }
 

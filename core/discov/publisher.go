@@ -129,6 +129,13 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 			case _, ok := <-ch:
 				if !ok {
 					p.revoke(cli)
+					// [Muxi Patch] remove the cached client so the next
+					// doRegister() lazily creates a fresh one with a new
+					// auth token (clientv3 does not refresh tokens on the
+					// keepalive/watch streams, see etcd-io/etcd#12385).
+					if err := internal.GetRegistry().InvalidateConn(p.endpoints); err != nil {
+						logx.Errorf("etcd publisher invalidate conn: %s", err.Error())
+					}
 					if err := p.doKeepAlive(); err != nil {
 						logx.Errorf("etcd publisher KeepAlive: %s", err.Error())
 					}
