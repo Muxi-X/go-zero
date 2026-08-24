@@ -21,5 +21,19 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ```go
 require github.com/zeromicro/go-zero v1.4.5
-replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi
+replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.1
 ```
+
+## 发版约定
+
+**修改补丁时打新 tag，勿覆盖已发布 tag。** Go module 版本不可变——一旦 tag 被 proxy 缓存，内容就固定（force push 不会刷新，反而导致依赖方拉到旧内容 / checksum mismatch）。正确做法：
+
+```bash
+# 改代码 -> commit 到 muxi-patch
+# 发版 -> 打新 tag（递增），不覆盖：
+git tag v1.4.5-muxi.2   # 下一次
+git push origin v1.4.5-muxi.2
+# 项目 go.mod replace 更新到新 tag
+```
+
+历史教训：`v1.4.5-muxi` 曾因 force push 覆盖，导致 proxy 缓存初版、生产部署拉到旧补丁。详见 Muxi-X/MuXiFresh-Be-2.0 PR #53。
