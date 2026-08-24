@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"context"
 	"sync"
 	"testing"
 
@@ -22,6 +23,6 @@ func TestStateWatcher_watch(t *testing.T) {
 	conn.EXPECT().GetState().Return(connectivity.TransientFailure)
 	conn.EXPECT().GetState().Return(connectivity.Ready).AnyTimes()
 	conn.EXPECT().WaitForStateChange(gomock.Any(), gomock.Any()).Return(true).AnyTimes()
-	go watcher.watch(conn)
+	go watcher.watch(context.Background(), conn)
 	wg.Wait()
 }

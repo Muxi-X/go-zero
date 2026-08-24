@@ -216,6 +216,12 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 func (c *cluster) load(cli EtcdClient, key string) int64 {
 	var resp *clientv3.GetResponse
 	for {
+		select {
+		case <-c.done:
+			return 0
+		default:
+		}
+
 		var err error
 		ctx, cancel := context.WithTimeout(c.context(cli), RequestTimeout)
 		resp, err = cli.Get(ctx, makeKeyPrefix(key), clientv3.WithPrefix())
@@ -270,7 +276,16 @@ func (c *cluster) newClient() (EtcdClient, error) {
 	return cli, nil
 }
 
-func (c *cluster) reload(cli EtcdClient) {
+func (c *cluster) reload() {
+	// always use the currently cached client from the connection manager,
+	// otherwise a stale (closed) client could be used to reload. Since
+	// RemoveResource atomically deletes before closing, the cache never
+	// holds a closed client.
+	cli, err := c.getClient()
+	if err != nil {
+		return
+	}
+
 	c.lock.Lock()
 	close(c.done)
 	c.watchGroup.Wait()
@@ -367,9 +382,11 @@ func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) bool {
 func (c *cluster) watchConnState(cli EtcdClient) {
 	watcher := newStateWatcher()
 	watcher.addListener(func() {
-		go c.reload(cli)
+		go c.reload()
 	})
-	watcher.watch(cli.ActiveConnection())
+	// pass cli.Ctx() so the goroutine exits once the client is closed,
+	// otherwise it leaks forever on a Shutdown connection.
+	watcher.watch(cli.Ctx(), cli.ActiveConnection())
 }
 
 // DialClient dials an etcd cluster with given endpoints.

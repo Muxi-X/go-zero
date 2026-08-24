@@ -56,11 +56,14 @@ func (sw *stateWatcher) updateState(conn etcdConn) {
 	}
 }
 
-func (sw *stateWatcher) watch(conn etcdConn) {
+func (sw *stateWatcher) watch(ctx context.Context, conn etcdConn) {
 	sw.currentState = conn.GetState()
 	for {
-		if conn.WaitForStateChange(context.Background(), sw.currentState) {
-			sw.updateState(conn)
+		if !conn.WaitForStateChange(ctx, sw.currentState) {
+			// ctx is done (the underlying etcd client was closed), exit to
+			// avoid leaking this goroutine.
+			return
 		}
+		sw.updateState(conn)
 	}
 }
