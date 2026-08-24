@@ -1,7 +1,9 @@
 package discov
 
 import (
+	"context"
 	"errors"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/core/stringx"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
 )
 
 func init() {
@@ -168,4 +171,85 @@ func TestPublisher_Resume(t *testing.T) {
 		t.Fail()
 	}()
 	<-publisher.resumeChan
+}
+
+func createMockConn(t *testing.T) *grpc.ClientConn {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithInsecure())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis.Close()
+	return conn
+}
+
+func TestPublisher_keepAliveAsyncRefreshesClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const (
+		firstLease  clientv3.LeaseID = 1
+		secondLease clientv3.LeaseID = 2
+	)
+	endpoints := []string{"auth-expired-" + stringx.Rand()}
+	firstConn := createMockConn(t)
+	defer firstConn.Close()
+	secondConn := createMockConn(t)
+	defer secondConn.Close()
+
+	firstCli := internal.NewMockEtcdClient(ctrl)
+	secondCli := internal.NewMockEtcdClient(ctrl)
+	restore := setMockClients(firstCli, secondCli)
+	defer restore()
+
+	firstKeepAliveChan := make(chan *clientv3.LeaseKeepAliveResponse)
+	secondKeepAliveChan := make(chan *clientv3.LeaseKeepAliveResponse)
+
+	firstCli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	firstCli.EXPECT().ActiveConnection().Return(firstConn).AnyTimes()
+	firstCli.EXPECT().Grant(gomock.Any(), timeToLive).Return(&clientv3.LeaseGrantResponse{
+		ID: firstLease,
+	}, nil)
+	firstCli.EXPECT().Put(gomock.Any(), makeEtcdKey("thekey", int64(firstLease)), "thevalue",
+		gomock.Any())
+	firstCli.EXPECT().KeepAlive(gomock.Any(), firstLease).Return(firstKeepAliveChan, nil)
+	firstCli.EXPECT().Revoke(gomock.Any(), firstLease)
+	firstCli.EXPECT().Close().Return(errors.New("close error"))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	secondKeepAliveStarted := make(chan struct{})
+	secondCli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	secondCli.EXPECT().ActiveConnection().Return(secondConn).AnyTimes()
+	secondCli.EXPECT().Grant(gomock.Any(), timeToLive).Return(&clientv3.LeaseGrantResponse{
+		ID: secondLease,
+	}, nil)
+	secondCli.EXPECT().Put(gomock.Any(), makeEtcdKey("thekey", int64(secondLease)), "thevalue",
+		gomock.Any())
+	secondCli.EXPECT().KeepAlive(gomock.Any(), secondLease).DoAndReturn(func(context.Context,
+		clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
+		close(secondKeepAliveStarted)
+		return secondKeepAliveChan, nil
+	})
+	secondCli.EXPECT().Revoke(gomock.Any(), secondLease).Do(func(_, _ interface{}) {
+		wg.Done()
+	})
+	secondCli.EXPECT().Close()
+
+	pub := NewPublisher(endpoints, "thekey", "thevalue")
+	assert.Nil(t, pub.KeepAlive())
+	close(firstKeepAliveChan)
+
+	select {
+	case <-secondKeepAliveStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for publisher to refresh the client")
+	}
+
+	pub.Stop()
+	wg.Wait()
+	assert.NoError(t, internal.GetRegistry().InvalidateConn(endpoints))
 }

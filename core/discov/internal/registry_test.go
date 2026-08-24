@@ -47,6 +47,28 @@ func TestGetClusterKey(t *testing.T) {
 		getClusterKey([]string{"remotehost:5678", "localhost:1234"}))
 }
 
+type trackedCloser struct {
+	closeCount int
+}
+
+func (tc *trackedCloser) Close() error {
+	tc.closeCount++
+	return nil
+}
+
+func TestRegistry_InvalidateConn(t *testing.T) {
+	endpoints := []string{"invalidate-" + stringx.Rand()}
+	closer := new(trackedCloser)
+
+	connManager.Inject(getClusterKey(endpoints), closer)
+
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints))
+	assert.Equal(t, 1, closer.closeCount)
+
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints))
+	assert.Equal(t, 1, closer.closeCount)
+}
+
 func TestCluster_HandleChanges(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	l := NewMockUpdateListener(ctrl)

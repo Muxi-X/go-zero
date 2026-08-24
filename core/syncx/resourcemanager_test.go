@@ -97,3 +97,33 @@ func TestResourceManager_Inject(t *testing.T) {
 	assert.Nil(t, err)
 	assert.Equal(t, 10, val.(*dummyResource).age)
 }
+
+type trackedResource struct {
+	closed bool
+}
+
+func (tr *trackedResource) Close() error {
+	tr.closed = true
+	return nil
+}
+
+func TestResourceManager_RemoveResource(t *testing.T) {
+	manager := NewResourceManager()
+	defer manager.Close()
+
+	resource := &trackedResource{}
+	manager.Inject("key", resource)
+
+	assert.NoError(t, manager.RemoveResource("key"))
+	assert.True(t, resource.closed)
+
+	_, ok := manager.resources["key"]
+	assert.False(t, ok)
+}
+
+func TestResourceManager_RemoveResourceMissing(t *testing.T) {
+	manager := NewResourceManager()
+	defer manager.Close()
+
+	assert.NoError(t, manager.RemoveResource("missing"))
+}
