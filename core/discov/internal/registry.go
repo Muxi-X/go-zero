@@ -329,12 +329,12 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		if err := connManager.RemoveResource(c.key); err != nil {
 			logx.Errorf("remove etcd client resource: %v", err)
 		}
-		time.Sleep(coolDownInterval)
-
+		timer := time.NewTimer(coolDownInterval)
 		select {
+		case <-timer.C:
 		case <-c.done:
+			timer.Stop()
 			return
-		default:
 		}
 
 		newCli, err := c.getClient()

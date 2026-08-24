@@ -16,6 +16,7 @@ import (
 	"github.com/zeromicro/go-zero/core/stringx"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 func init() {
@@ -178,7 +179,7 @@ func createMockConn(t *testing.T) *grpc.ClientConn {
 	if err != nil {
 		t.Fatal(err)
 	}
-	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithInsecure())
+	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
