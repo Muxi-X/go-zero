@@ -342,6 +342,15 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 			logx.Errorf("recreate etcd client: %v", err)
 			continue
 		}
+		if newCli.Ctx().Err() != nil {
+			// The freshly created client may have been closed by another
+			// failing source (e.g. a concurrent watcher or the publisher's
+			// InvalidateConn) racing with this recreation. load() would then
+			// retry forever on the closed client, so bail out and redo the
+			// whole invalidation+recreation cycle.
+			logx.Errorf("etcd client invalidated during recreation, retry")
+			continue
+		}
 		cli = newCli
 		rev = c.load(cli, key)
 	}
