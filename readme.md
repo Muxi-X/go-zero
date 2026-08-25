@@ -21,7 +21,7 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ```go
 require github.com/zeromicro/go-zero v1.4.5
-replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.1
+replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.2
 ```
 
 ## 发版约定
@@ -31,8 +31,8 @@ replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.1
 ```bash
 # 改代码 -> commit 到 muxi-patch
 # 发版 -> 打新 tag（递增），不覆盖：
-git tag v1.4.5-muxi.2   # 下一次
-git push origin v1.4.5-muxi.2
+git tag v1.4.5-muxi.3   # 下一次
+git push origin v1.4.5-muxi.3
 # 项目 go.mod replace 更新到新 tag
 ```
 
