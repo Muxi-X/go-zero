@@ -12,6 +12,7 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 - `core/syncx/resourcemanager.go`：新增 `RemoveResource`（移除并关闭单个缓存资源）
 - `core/discov/internal/registry.go`：新增 `InvalidateConn`；`watch()` 失败后移除缓存 client，下次 `getClient()` 惰性创建新 client 重新认证
 - `core/discov/publisher.go`：keepalive 关闭时同样失效缓存 client
+- `core/discov/internal/registry.go`（`load()`）：client 的 Ctx 已取消（已被并发失效源关闭）时立即返回，避免对死 client 无限 Get 导致 watcher 永久卡死（否则 `load()` 唯一出口 `c.done` 只在连接状态变化时关闭，token 失效不算，故不自愈）
 
 思路对齐上游 PR #5709：**惰性失效 + 单飞重建**（不主动重建，避免并发/泄漏问题）。
 
@@ -21,8 +22,15 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ```go
 require github.com/zeromicro/go-zero v1.4.5
-replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.2
+replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.3
 ```
+
+## 版本历史
+
+- `v1.4.5-muxi`：初版（主动重建，弃用）
+- `v1.4.5-muxi.1`：惰性失效
+- `v1.4.5-muxi.2`：修复重建时 client 被并发 Close 的竞态
+- `v1.4.5-muxi.3`：修复 `load()` 对已关闭 client 无限重试导致 watcher 永久卡死（生产实测：etcd 认证 token 过期触发失效风暴后不自愈）
 
 ## 发版约定
 

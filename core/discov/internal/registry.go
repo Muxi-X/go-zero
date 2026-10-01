@@ -222,6 +222,18 @@ func (c *cluster) load(cli EtcdClient, key string) int64 {
 		default:
 		}
 
+		// [Muxi Patch]
+		// A client with a canceled context has been closed (e.g. by another
+		// watcher's RemoveResource, or the publisher's InvalidateConn). Get on
+		// it can never succeed, and this loop has no exit other than c.done —
+		// which is only closed on a connection-state change, not on token
+		// expiry. Without this check load() would spin forever on the dead
+		// client, leaving the key's watcher stuck and the service on stale
+		// addresses. Return instead so watch() can recreate the client.
+		if cli.Ctx().Err() != nil {
+			return 0
+		}
+
 		var err error
 		ctx, cancel := context.WithTimeout(c.context(cli), RequestTimeout)
 		resp, err = cli.Get(ctx, makeKeyPrefix(key), clientv3.WithPrefix())

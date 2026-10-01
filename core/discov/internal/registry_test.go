@@ -147,7 +147,7 @@ func TestCluster_Load(t *testing.T) {
 			},
 		},
 	}, nil)
-	cli.EXPECT().Ctx().Return(context.Background())
+	cli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
 	c := &cluster{
 		values: make(map[string]map[string]string),
 	}
@@ -261,6 +261,40 @@ func TestClusterWatch_CloseChan(t *testing.T) {
 		close(c.done)
 	}()
 	c.watch(cli, "any", 0)
+}
+
+// TestCluster_LoadOnClosedClientReturns covers the load() fix: when the client
+// has been closed (its Ctx is canceled), load() must return promptly instead of
+// spinning forever on Get. It must not issue a Get on the dead client at all;
+// the caller (watch/monitor/reload) then recreates the client.
+func TestCluster_LoadOnClosedClientReturns(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	deadCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+	// Get on a closed client can never succeed; it must not be attempted.
+	cli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	c := &cluster{
+		done:   make(chan lang.PlaceholderType),
+		values: make(map[string]map[string]string),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.load(cli, "any")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("load did not return on a closed client")
+	}
 }
 
 func TestValueOnlyContext(t *testing.T) {
