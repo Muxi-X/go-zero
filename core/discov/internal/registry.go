@@ -41,9 +41,11 @@ func (r *Registry) GetConn(endpoints []string) (EtcdClient, error) {
 	return c.getClient()
 }
 
-// InvalidateConn removes the cached etcd client associated with given endpoints.
-func (r *Registry) InvalidateConn(endpoints []string) error {
-	return connManager.RemoveResource(getClusterKey(endpoints))
+// InvalidateConn removes the cached etcd client associated with given
+// endpoints, but only when it is still cli. Conditional removal avoids closing
+// a client that another watcher or publisher has already recreated.
+func (r *Registry) InvalidateConn(endpoints []string, cli EtcdClient) error {
+	return connManager.RemoveResourceIf(getClusterKey(endpoints), cli)
 }
 
 // Monitor monitors the key on given etcd endpoints, notify with the given UpdateListener.
@@ -224,7 +226,7 @@ func (c *cluster) load(cli EtcdClient, key string) int64 {
 
 		// [Muxi Patch]
 		// A client with a canceled context has been closed (e.g. by another
-		// watcher's RemoveResource, or the publisher's InvalidateConn). Get on
+		// watcher's RemoveResourceIf, or the publisher's InvalidateConn). Get on
 		// it can never succeed, and this loop has no exit other than c.done —
 		// which is only closed on a connection-state change, not on token
 		// expiry. Without this check load() would spin forever on the dead
@@ -291,7 +293,7 @@ func (c *cluster) newClient() (EtcdClient, error) {
 func (c *cluster) reload() {
 	// always use the currently cached client from the connection manager,
 	// otherwise a stale (closed) client could be used to reload. Since
-	// RemoveResource atomically deletes before closing, the cache never
+	// RemoveResourceIf atomically deletes before closing, the cache never
 	// holds a closed client.
 	cli, err := c.getClient()
 	if err != nil {
@@ -336,9 +338,12 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		// expires. Remove the cached client so the next getClient() lazily
 		// creates a fresh one (with a new token). Single-flight guarantees
 		// only one client is recreated even when multiple watchers fail
-		// together. Retry with a cooldown to avoid a tight loop.
+		// together. Removal is conditional on cli: a concurrent watcher may
+		// have already replaced the cached client, and closing that fresh
+		// client would disrupt it for no reason. Retry with a cooldown to
+		// avoid a tight loop.
 		logx.Errorf("etcd monitor chan exited, invalidate client and retry in %v", coolDownInterval)
-		if err := connManager.RemoveResource(c.key); err != nil {
+		if err := connManager.RemoveResourceIf(c.key, cli); err != nil {
 			logx.Errorf("remove etcd client resource: %v", err)
 		}
 		timer := time.NewTimer(coolDownInterval)

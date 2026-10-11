@@ -76,12 +76,17 @@ func (manager *ResourceManager) Inject(key string, resource io.Closer) {
 	manager.lock.Unlock()
 }
 
-// RemoveResource removes the resource associated with given key.
-func (manager *ResourceManager) RemoveResource(key string) error {
+// RemoveResourceIf removes the resource associated with given key, but only
+// when it is still the given resource. If the key holds a different resource
+// (e.g. one recreated concurrently), it is left untouched and nil is returned.
+// The resource is matched by identity, so its dynamic type must be comparable.
+func (manager *ResourceManager) RemoveResourceIf(key string, resource io.Closer) error {
 	manager.lock.Lock()
-	resource, ok := manager.resources[key]
-	if ok {
+	current, ok := manager.resources[key]
+	if ok && current == resource {
 		delete(manager.resources, key)
+	} else {
+		ok = false
 	}
 	manager.lock.Unlock()
 

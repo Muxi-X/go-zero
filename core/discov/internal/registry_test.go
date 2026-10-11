@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -51,26 +52,49 @@ func TestGetClusterKey(t *testing.T) {
 		getClusterKey([]string{"remotehost:5678", "localhost:1234"}))
 }
 
-type trackedCloser struct {
-	closeCount int
-}
-
-func (tc *trackedCloser) Close() error {
-	tc.closeCount++
-	return nil
-}
-
 func TestRegistry_InvalidateConn(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
 	endpoints := []string{"invalidate-" + stringx.Rand()}
-	closer := new(trackedCloser)
+	key := getClusterKey(endpoints)
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Close().Return(nil)
 
-	connManager.Inject(getClusterKey(endpoints), closer)
+	connManager.Inject(key, cli)
 
-	assert.NoError(t, GetRegistry().InvalidateConn(endpoints))
-	assert.Equal(t, 1, closer.closeCount)
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints, cli))
 
-	assert.NoError(t, GetRegistry().InvalidateConn(endpoints))
-	assert.Equal(t, 1, closer.closeCount)
+	// The cached entry was removed, so GetResource creates a fresh one.
+	created := NewMockEtcdClient(ctrl)
+	val, err := connManager.GetResource(key, func() (io.Closer, error) {
+		return created, nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, created, val)
+}
+
+func TestRegistry_InvalidateConnStaleClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	endpoints := []string{"invalidate-stale-" + stringx.Rand()}
+	key := getClusterKey(endpoints)
+	cached := NewMockEtcdClient(ctrl)
+	stale := NewMockEtcdClient(ctrl)
+	// The cached client belongs to someone else and must not be closed.
+	cached.EXPECT().Close().Times(0)
+
+	connManager.Inject(key, cached)
+
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints, stale))
+
+	// The cached client is still in place.
+	val, err := connManager.GetResource(key, func() (io.Closer, error) {
+		return stale, nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, cached, val)
 }
 
 func TestCluster_HandleChanges(t *testing.T) {

@@ -133,7 +133,9 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 					// doRegister() lazily creates a fresh one with a new
 					// auth token (clientv3 does not refresh tokens on the
 					// keepalive/watch streams, see etcd-io/etcd#12385).
-					if err := internal.GetRegistry().InvalidateConn(p.endpoints); err != nil {
+					// Conditional on this publisher's client: if another
+					// watcher already recreated it, keep the fresh one.
+					if err := internal.GetRegistry().InvalidateConn(p.endpoints, cli); err != nil {
 						logx.Errorf("etcd publisher invalidate conn: %s", err.Error())
 					}
 					if err := p.doKeepAlive(); err != nil {
@@ -151,7 +153,7 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 					// auth token. Doing it on pause would close the shared
 					// client and disrupt other watchers even when the token
 					// has not expired.
-					if err := internal.GetRegistry().InvalidateConn(p.endpoints); err != nil {
+					if err := internal.GetRegistry().InvalidateConn(p.endpoints, cli); err != nil {
 						logx.Errorf("etcd publisher invalidate conn: %s", err.Error())
 					}
 					if err := p.doKeepAlive(); err != nil {

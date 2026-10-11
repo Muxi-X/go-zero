@@ -8,10 +8,11 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ## 补丁
 
-以 `[Muxi Patch]` 标记，三个文件：
-- `core/syncx/resourcemanager.go`：新增 `RemoveResource`（移除并关闭单个缓存资源）
-- `core/discov/internal/registry.go`：新增 `InvalidateConn`；`watch()` 失败后移除缓存 client，下次 `getClient()` 惰性创建新 client 重新认证
-- `core/discov/publisher.go`：keepalive 关闭时同样失效缓存 client
+涉及四个源文件（其中 `registry.go`、`publisher.go` 的改动带 `[Muxi Patch]` 标记，`resourcemanager.go`、`statewatcher.go` 无标记）：
+- `core/syncx/resourcemanager.go`：新增 `RemoveResourceIf`（仅当缓存仍是该 client 时才移除并关闭，避免误关并发重建出的新 client）
+- `core/discov/internal/registry.go`：新增 `InvalidateConn`；`watch()` 失败后按 id 失效缓存 client，下次 `getClient()` 惰性创建新 client 重新认证
+- `core/discov/internal/statewatcher.go`：watch 改用可取消 ctx（`cli.Ctx()`），client 关闭时退出，避免 goroutine 泄漏
+- `core/discov/publisher.go`：keepalive 关闭 / resume 时同样按 id 失效缓存 client
 - `core/discov/internal/registry.go`（`load()`）：client 的 Ctx 已取消（已被并发失效源关闭）时立即返回，避免对死 client 无限 Get 导致 watcher 永久卡死（否则 `load()` 唯一出口 `c.done` 只在连接状态变化时关闭，token 失效不算，故不自愈）
 
 思路对齐上游 PR #5709：**惰性失效 + 单飞重建**（不主动重建，避免并发/泄漏问题）。

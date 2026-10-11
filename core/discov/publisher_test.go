@@ -252,5 +252,5 @@ func TestPublisher_keepAliveAsyncRefreshesClient(t *testing.T) {
 
 	pub.Stop()
 	wg.Wait()
-	assert.NoError(t, internal.GetRegistry().InvalidateConn(endpoints))
+	assert.NoError(t, internal.GetRegistry().InvalidateConn(endpoints, secondCli))
 }
