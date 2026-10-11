@@ -23,7 +23,7 @@ etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 wat
 
 ```go
 require github.com/zeromicro/go-zero v1.4.5
-replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.3
+replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.4
 ```
 
 ## 版本历史
@@ -32,6 +32,7 @@ replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.3
 - `v1.4.5-muxi.1`：惰性失效
 - `v1.4.5-muxi.2`：修复重建时 client 被并发 Close 的竞态
 - `v1.4.5-muxi.3`：修复 `load()` 对已关闭 client 无限重试导致 watcher 永久卡死（生产实测：etcd 认证 token 过期触发失效风暴后不自愈）
+- `v1.4.5-muxi.4`：失效缓存 client 时按 id 判断，仅在仍是失败的那个 client 时才移除，避免误关并发重建出的新 client 而打断其 watcher
 
 ## 发版约定
 
