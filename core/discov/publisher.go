@@ -129,6 +129,15 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 			case _, ok := <-ch:
 				if !ok {
 					p.revoke(cli)
+					// [Muxi Patch] remove the cached client so the next
+					// doRegister() lazily creates a fresh one with a new
+					// auth token (clientv3 does not refresh tokens on the
+					// keepalive/watch streams, see etcd-io/etcd#12385).
+					// Conditional on this publisher's client: if another
+					// watcher already recreated it, keep the fresh one.
+					if err := internal.GetRegistry().InvalidateConn(p.endpoints, cli); err != nil {
+						logx.Errorf("etcd publisher invalidate conn: %s", err.Error())
+					}
 					if err := p.doKeepAlive(); err != nil {
 						logx.Errorf("etcd publisher KeepAlive: %s", err.Error())
 					}
@@ -139,6 +148,14 @@ func (p *Publisher) keepAliveAsync(cli internal.EtcdClient) error {
 				p.revoke(cli)
 				select {
 				case <-p.resumeChan:
+					// [Muxi Patch] invalidate the cached client only on resume,
+					// so the doRegister below creates a fresh one with a new
+					// auth token. Doing it on pause would close the shared
+					// client and disrupt other watchers even when the token
+					// has not expired.
+					if err := internal.GetRegistry().InvalidateConn(p.endpoints, cli); err != nil {
+						logx.Errorf("etcd publisher invalidate conn: %s", err.Error())
+					}
 					if err := p.doKeepAlive(); err != nil {
 						logx.Errorf("etcd publisher KeepAlive: %s", err.Error())
 					}

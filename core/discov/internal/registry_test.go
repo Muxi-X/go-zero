@@ -2,8 +2,11 @@ package internal
 
 import (
 	"context"
+	"io"
+	"net"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/golang/mock/gomock"
 	"github.com/stretchr/testify/assert"
@@ -14,6 +17,8 @@ import (
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 var mockLock sync.Mutex
@@ -45,6 +50,51 @@ func TestGetCluster(t *testing.T) {
 func TestGetClusterKey(t *testing.T) {
 	assert.Equal(t, getClusterKey([]string{"localhost:1234", "remotehost:5678"}),
 		getClusterKey([]string{"remotehost:5678", "localhost:1234"}))
+}
+
+func TestRegistry_InvalidateConn(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	endpoints := []string{"invalidate-" + stringx.Rand()}
+	key := getClusterKey(endpoints)
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Close().Return(nil)
+
+	connManager.Inject(key, cli)
+
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints, cli))
+
+	// The cached entry was removed, so GetResource creates a fresh one.
+	created := NewMockEtcdClient(ctrl)
+	val, err := connManager.GetResource(key, func() (io.Closer, error) {
+		return created, nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, created, val)
+}
+
+func TestRegistry_InvalidateConnStaleClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	endpoints := []string{"invalidate-stale-" + stringx.Rand()}
+	key := getClusterKey(endpoints)
+	cached := NewMockEtcdClient(ctrl)
+	stale := NewMockEtcdClient(ctrl)
+	// The cached client belongs to someone else and must not be closed.
+	cached.EXPECT().Close().Times(0)
+
+	connManager.Inject(key, cached)
+
+	assert.NoError(t, GetRegistry().InvalidateConn(endpoints, stale))
+
+	// The cached client is still in place.
+	val, err := connManager.GetResource(key, func() (io.Closer, error) {
+		return stale, nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, cached, val)
 }
 
 func TestCluster_HandleChanges(t *testing.T) {
@@ -121,7 +171,7 @@ func TestCluster_Load(t *testing.T) {
 			},
 		},
 	}, nil)
-	cli.EXPECT().Ctx().Return(context.Background())
+	cli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
 	c := &cluster{
 		values: make(map[string]map[string]string),
 	}
@@ -237,8 +287,148 @@ func TestClusterWatch_CloseChan(t *testing.T) {
 	c.watch(cli, "any", 0)
 }
 
+// TestCluster_LoadOnClosedClientReturns covers the load() fix: when the client
+// has been closed (its Ctx is canceled), load() must return promptly instead of
+// spinning forever on Get. It must not issue a Get on the dead client at all;
+// the caller (watch/monitor/reload) then recreates the client.
+func TestCluster_LoadOnClosedClientReturns(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	deadCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+	// Get on a closed client can never succeed; it must not be attempted.
+	cli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Times(0)
+
+	c := &cluster{
+		done:   make(chan lang.PlaceholderType),
+		values: make(map[string]map[string]string),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.load(cli, "any")
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("load did not return on a closed client")
+	}
+}
+
 func TestValueOnlyContext(t *testing.T) {
 	ctx := contextx.ValueOnlyFrom(context.Background())
 	ctx.Done()
 	assert.Nil(t, ctx.Err())
+}
+
+func setMockClients(clis ...EtcdClient) func() {
+	mockLock.Lock()
+	index := 0
+	NewClient = func([]string) (EtcdClient, error) {
+		if index >= len(clis) {
+			panic("unexpected etcd client creation")
+		}
+
+		cli := clis[index]
+		index++
+		return cli, nil
+	}
+	return func() {
+		NewClient = DialClient
+		mockLock.Unlock()
+	}
+}
+
+func createMockConn(t *testing.T) *grpc.ClientConn {
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := grpc.Dial(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	lis.Close()
+	return conn
+}
+
+// TestClusterWatch_RecreatedClientInvalidated covers the Bug 1 fix: if a
+// freshly recreated client is concurrently closed by another invalidation
+// source (its Ctx is already canceled), watch() must not proceed to load() on
+// the dead client; it redoes the invalidation+recreation cycle until a live
+// client is obtained.
+func TestClusterWatch_RecreatedClientInvalidated(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	deadCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	deadCli := NewMockEtcdClient(ctrl)
+	deadCli.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+	deadCli.EXPECT().Close().Return(nil).AnyTimes()
+
+	aliveCli := NewMockEtcdClient(ctrl)
+	aliveCli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+
+	conn := createMockConn(t)
+	defer conn.Close()
+	deadCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	aliveCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+
+	// Two watch failures drive the recreation loop; both are consumed by the
+	// initial (dead) client's watchStream.
+	watchCh := make(chan clientv3.WatchResponse, 2)
+	watchCh <- clientv3.WatchResponse{Canceled: true}
+	watchCh <- clientv3.WatchResponse{Canceled: true}
+	deadCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(watchCh).AnyTimes()
+	aliveCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(watchCh).AnyTimes()
+
+	aliveGet := make(chan struct{})
+	aliveCli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(_ context.Context, _ string, _ ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			select {
+			case <-aliveGet:
+			default:
+				close(aliveGet)
+			}
+			return &clientv3.GetResponse{Header: &etcdserverpb.ResponseHeader{}}, nil
+		}).AnyTimes()
+
+	restore := setMockClients(deadCli, aliveCli)
+	defer restore()
+
+	c := new(cluster)
+	c.key = "recreated-invalidated-" + stringx.Rand()
+	c.done = make(chan lang.PlaceholderType)
+	c.listeners = make(map[string][]UpdateListener)
+	c.values = make(map[string]map[string]string)
+
+	done := make(chan struct{})
+	go func() {
+		c.watch(deadCli, "any", 0)
+		close(done)
+	}()
+
+	// First failure -> recreate -> getClient returns deadCli (Ctx canceled)
+	// -> the Bug 1 guard retries; second failure -> getClient returns aliveCli
+	// -> load(aliveCli) succeeds.
+	select {
+	case <-aliveGet:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the alive client to be used")
+	}
+
+	close(c.done)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not exit")
+	}
 }

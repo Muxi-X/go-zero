@@ -41,6 +41,13 @@ func (r *Registry) GetConn(endpoints []string) (EtcdClient, error) {
 	return c.getClient()
 }
 
+// InvalidateConn removes the cached etcd client associated with given
+// endpoints, but only when it is still cli. Conditional removal avoids closing
+// a client that another watcher or publisher has already recreated.
+func (r *Registry) InvalidateConn(endpoints []string, cli EtcdClient) error {
+	return connManager.RemoveResourceIf(getClusterKey(endpoints), cli)
+}
+
 // Monitor monitors the key on given etcd endpoints, notify with the given UpdateListener.
 func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener) error {
 	c, exists := r.getCluster(endpoints)
@@ -211,6 +218,24 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 func (c *cluster) load(cli EtcdClient, key string) int64 {
 	var resp *clientv3.GetResponse
 	for {
+		select {
+		case <-c.done:
+			return 0
+		default:
+		}
+
+		// [Muxi Patch]
+		// A client with a canceled context has been closed (e.g. by another
+		// watcher's RemoveResourceIf, or the publisher's InvalidateConn). Get on
+		// it can never succeed, and this loop has no exit other than c.done —
+		// which is only closed on a connection-state change, not on token
+		// expiry. Without this check load() would spin forever on the dead
+		// client, leaving the key's watcher stuck and the service on stale
+		// addresses. Return instead so watch() can recreate the client.
+		if cli.Ctx().Err() != nil {
+			return 0
+		}
+
 		var err error
 		ctx, cancel := context.WithTimeout(c.context(cli), RequestTimeout)
 		resp, err = cli.Get(ctx, makeKeyPrefix(key), clientv3.WithPrefix())
@@ -265,7 +290,16 @@ func (c *cluster) newClient() (EtcdClient, error) {
 	return cli, nil
 }
 
-func (c *cluster) reload(cli EtcdClient) {
+func (c *cluster) reload() {
+	// always use the currently cached client from the connection manager,
+	// otherwise a stale (closed) client could be used to reload. Since
+	// RemoveResourceIf atomically deletes before closing, the cache never
+	// holds a closed client.
+	cli, err := c.getClient()
+	if err != nil {
+		return
+	}
+
 	c.lock.Lock()
 	close(c.done)
 	c.watchGroup.Wait()
@@ -291,6 +325,51 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		if c.watchStream(cli, key, rev) {
 			return
 		}
+
+		select {
+		case <-c.done:
+			return
+		default:
+		}
+
+		// [Muxi Patch]
+		// clientv3 does not refresh the auth token on watch streams (#12385),
+		// so a long-lived watch fails with "invalid auth token" once the token
+		// expires. Remove the cached client so the next getClient() lazily
+		// creates a fresh one (with a new token). Single-flight guarantees
+		// only one client is recreated even when multiple watchers fail
+		// together. Removal is conditional on cli: a concurrent watcher may
+		// have already replaced the cached client, and closing that fresh
+		// client would disrupt it for no reason. Retry with a cooldown to
+		// avoid a tight loop.
+		logx.Errorf("etcd monitor chan exited, invalidate client and retry in %v", coolDownInterval)
+		if err := connManager.RemoveResourceIf(c.key, cli); err != nil {
+			logx.Errorf("remove etcd client resource: %v", err)
+		}
+		timer := time.NewTimer(coolDownInterval)
+		select {
+		case <-timer.C:
+		case <-c.done:
+			timer.Stop()
+			return
+		}
+
+		newCli, err := c.getClient()
+		if err != nil {
+			logx.Errorf("recreate etcd client: %v", err)
+			continue
+		}
+		if newCli.Ctx().Err() != nil {
+			// The freshly created client may have been closed by another
+			// failing source (e.g. a concurrent watcher or the publisher's
+			// InvalidateConn) racing with this recreation. load() would then
+			// retry forever on the closed client, so bail out and redo the
+			// whole invalidation+recreation cycle.
+			logx.Errorf("etcd client invalidated during recreation, retry")
+			continue
+		}
+		cli = newCli
+		rev = c.load(cli, key)
 	}
 }
 
@@ -329,9 +408,11 @@ func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) bool {
 func (c *cluster) watchConnState(cli EtcdClient) {
 	watcher := newStateWatcher()
 	watcher.addListener(func() {
-		go c.reload(cli)
+		go c.reload()
 	})
-	watcher.watch(cli.ActiveConnection())
+	// pass cli.Ctx() so the goroutine exits once the client is closed,
+	// otherwise it leaks forever on a Shutdown connection.
+	watcher.watch(cli.Ctx(), cli.ActiveConnection())
 }
 
 // DialClient dials an etcd cluster with given endpoints.

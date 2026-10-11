@@ -1,275 +1,49 @@
-# go-zero
-<p align="center">
-<img align="center" width="150px" src="https://raw.githubusercontent.com/zeromicro/zero-doc/main/doc/images/go-zero.png">
-</p>
+# go-zero (Muxi fork)
 
-go-zero is a web and rpc framework with lots of builtin engineering practices. It’s born to ensure the stability of the busy services with resilience design and has been serving sites with tens of millions of users for years.
+go-zero `v1.4.5` 的 fork，带一个 discov 补丁，修复 etcd 认证下 watch 周期性报 `invalid auth token` 刷屏的问题。
 
-<div align=center>
+## 问题
 
-[![Go](https://github.com/zeromicro/go-zero/workflows/Go/badge.svg?branch=master)](https://github.com/zeromicro/go-zero/actions)
-[![codecov](https://codecov.io/gh/zeromicro/go-zero/branch/master/graph/badge.svg)](https://codecov.io/gh/zeromicro/go-zero)
-[![Go Report Card](https://goreportcard.com/badge/github.com/zeromicro/go-zero)](https://goreportcard.com/report/github.com/zeromicro/go-zero)
-[![Release](https://img.shields.io/github/v/release/zeromicro/go-zero.svg?style=flat-square)](https://github.com/zeromicro/go-zero)
-[![Go Reference](https://pkg.go.dev/badge/github.com/zeromicro/go-zero.svg)](https://pkg.go.dev/github.com/zeromicro/go-zero)
-[![Awesome Go](https://cdn.rawgit.com/sindresorhus/awesome/d7305f38d29fed78fa85652e3a63e154dd8e8829/media/badge.svg)](https://github.com/avelino/awesome-go)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Discord](https://img.shields.io/discord/794530774463414292?label=chat&logo=discord)](https://discord.gg/4JQvC5A4Fe)
+etcd 用户名密码认证的 token 默认 5 分钟过期，而 clientv3 的 watch 在 token 过期后不自动刷新（etcd-io/etcd#12385），go-zero 又无限紧密重试同一个 client，导致刷屏 + CPU/磁盘耗尽。etcd 官方明确不修（workaround 是重建 client），go-zero 的修复 #5709 也未合并，因此 fork 打补丁。
 
-</div>
+## 补丁
 
+涉及四个源文件（其中 `registry.go`、`publisher.go` 的改动带 `[Muxi Patch]` 标记，`resourcemanager.go`、`statewatcher.go` 无标记）：
+- `core/syncx/resourcemanager.go`：新增 `RemoveResourceIf`（仅当缓存仍是该 client 时才移除并关闭，避免误关并发重建出的新 client）
+- `core/discov/internal/registry.go`：新增 `InvalidateConn`；`watch()` 失败后按 id 失效缓存 client，下次 `getClient()` 惰性创建新 client 重新认证
+- `core/discov/internal/statewatcher.go`：watch 改用可取消 ctx（`cli.Ctx()`），client 关闭时退出，避免 goroutine 泄漏
+- `core/discov/publisher.go`：keepalive 关闭 / resume 时同样按 id 失效缓存 client
+- `core/discov/internal/registry.go`（`load()`）：client 的 Ctx 已取消（已被并发失效源关闭）时立即返回，避免对死 client 无限 Get 导致 watcher 永久卡死（否则 `load()` 唯一出口 `c.done` 只在连接状态变化时关闭，token 失效不算，故不自愈）
 
-## 🤷‍ What is go-zero?
-English | [简体中文](readme-cn.md)
+思路对齐上游 PR #5709：**惰性失效 + 单飞重建**（不主动重建，避免并发/泄漏问题）。
 
-<a href="https://www.producthunt.com/posts/go-zero?utm_source=badge-featured&utm_medium=badge&utm_souce=badge-go&#0045;zero" target="_blank"><img src="https://api.producthunt.com/widgets/embed-image/v1/featured.svg?post_id=334030&theme=light" alt="go&#0045;zero - A&#0032;web&#0032;&#0038;&#0032;rpc&#0032;framework&#0032;written&#0032;in&#0032;Go&#0046; | Product Hunt" style="width: 250px; height: 54px;" width="250" height="54" /></a>
+## 使用
 
+`go.mod`:
 
-go-zero (listed in CNCF Landscape: [https://landscape.cncf.io/?selected=go-zero](https://landscape.cncf.io/?selected=go-zero)) is a web and rpc framework with lots of builtin engineering practices. It’s born to ensure the stability of the busy services with resilience design and has been serving sites with tens of millions of users for years.
-
-go-zero contains simple API description syntax and code generation tool called `goctl`. You can generate Go, iOS, Android, Kotlin, Dart, TypeScript, JavaScript from .api files with `goctl`.
-
-#### Advantages of go-zero:
-
-* improve the stability of the services with tens of millions of daily active users
-* builtin chained timeout control, concurrency control, rate limit, adaptive circuit breaker, adaptive load shedding, even no configuration needed
-* builtin middlewares also can be integrated into your frameworks
-* simple API syntax, one command to generate a couple of different languages
-* auto validate the request parameters from clients
-* plenty of builtin microservice management and concurrent toolkits
-
-<img src="https://raw.githubusercontent.com/zeromicro/zero-doc/main/doc/images/architecture-en.png" alt="Architecture" width="1500" />
-
-## Backgrounds of go-zero
-
-At the beginning of 2018, we decided to re-design our system, from monolithic architecture with Java+MongoDB to microservice architecture. After research and comparison, we chose to:
-
-* Golang based
-  * great performance
-  * simple syntax
-  * proven engineering efficiency
-  * extreme deployment experience
-  * less server resource consumption
-* Self-designed microservice architecture
-  * I have rich experience in designing microservice architectures
-  * easy to locate the problems
-  * easy to extend the features
-
-## Design considerations on go-zero
-
-By designing the microservice architecture, we expected to ensure stability, as well as productivity. And from just the beginning, we have the following design principles:
-
-* keep it simple
-* high availability
-* stable on high concurrency
-* easy to extend
-* resilience design, failure-oriented programming
-* try best to be friendly to the business logic development, encapsulate the complexity
-* one thing, one way
-
-After almost half a year, we finished the transfer from a monolithic system to microservice system and deployed on August 2018. The new system guaranteed business growth and system stability.
-
-## The implementation and features of go-zero
-
-go-zero is a web and rpc framework that integrates lots of engineering practices. The features are mainly listed below:
-
-* powerful tool included, less code to write
-* simple interfaces
-* fully compatible with net/http
-* middlewares are supported, easy to extend
-* high performance
-* failure-oriented programming, resilience design
-* builtin service discovery, load balancing
-* builtin concurrency control, adaptive circuit breaker, adaptive load shedding, auto-trigger, auto recover
-* auto validation of API request parameters
-* chained timeout control
-* auto management of data caching
-* call tracing, metrics, and monitoring
-* high concurrency protected
-
-As below, go-zero protects the system with a couple of layers and mechanisms:
-
-![Resilience](https://raw.githubusercontent.com/zeromicro/zero-doc/main/doc/images/resilience-en.png)
-
-##  The simplified architecture that we use with go-zero
-
-<img width="1067" alt="image" src="https://user-images.githubusercontent.com/1918356/171880372-5010d846-e8b1-4942-8fe2-e2bbb584f762.png">
-
-##  Installation
-
-Run the following command under your project:
-
-```shell
-go get -u github.com/zeromicro/go-zero
-```
-## Upgrade
-
-To upgrade from versions eariler than v1.3.0, run the following commands.
-
-```shell
-go install github.com/zeromicro/go-zero/tools/goctl@latest
+```go
+require github.com/zeromicro/go-zero v1.4.5
+replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.4
 ```
 
-```shell
-goctl migrate —verbose —version v1.4.3
+## 版本历史
+
+- `v1.4.5-muxi`：初版（主动重建，弃用）
+- `v1.4.5-muxi.1`：惰性失效
+- `v1.4.5-muxi.2`：修复重建时 client 被并发 Close 的竞态
+- `v1.4.5-muxi.3`：修复 `load()` 对已关闭 client 无限重试导致 watcher 永久卡死（生产实测：etcd 认证 token 过期触发失效风暴后不自愈）
+- `v1.4.5-muxi.4`：失效缓存 client 时按 id 判断，仅在仍是失败的那个 client 时才移除，避免误关并发重建出的新 client 而打断其 watcher
+
+## 发版约定
+
+**修改补丁时打新 tag，勿覆盖已发布 tag。** Go module 版本不可变——一旦 tag 被 proxy 缓存，内容就固定（force push 不会刷新，反而导致依赖方拉到旧内容 / checksum mismatch）。正确做法：
+
+```bash
+# 改代码 -> commit 到 muxi-patch
+# 发版 -> 打新 tag（递增），不覆盖：
+git tag v1.4.5-muxi.3   # 下一次
+git push origin v1.4.5-muxi.3
+# 项目 go.mod replace 更新到新 tag
 ```
 
-##  Quick Start
-
-1. full examples can be checked out from below:
-
-     [Rapid development of microservice systems](https://github.com/zeromicro/zero-doc/blob/main/doc/shorturl-en.md)
-
-     [Rapid development of microservice systems - multiple RPCs](https://github.com/zeromicro/zero-doc/blob/main/docs/zero/bookstore-en.md)
-
-2. install goctl
-
-   `goctl`can be read as `go control`. `goctl` means not to be controlled by code, instead, we control it. The inside `go` is not `golang`. At the very beginning, I was expecting it to help us improve productivity, and make our lives easier.
-
-   ```shell
-   # for Go 1.15 and earlier
-   GO111MODULE=on go get -u github.com/zeromicro/go-zero/tools/goctl@latest
-
-   # for Go 1.16 and later
-   go install github.com/zeromicro/go-zero/tools/goctl@latest
-
-   # For Mac
-   brew install goctl
-
-   # docker for amd64 architecture
-   docker pull kevinwan/goctl
-   # run goctl like
-   docker run --rm -it -v `pwd`:/app kevinwan/goctl goctl --help
-
-   # docker for arm64 (M1) architecture
-   docker pull kevinwan/goctl:latest-arm64
-   # run goctl like
-   docker run --rm -it -v `pwd`:/app kevinwan/goctl:latest-arm64 goctl --help
-   ```
-
-   make sure goctl is executable.
-
-3. create the API file, like greet.api, you can install the plugin of goctl in vs code, api syntax is supported.
-
-   ```go
-   type (
-     Request {
-       Name string `path:"name,options=[you,me]"` // parameters are auto validated
-     }
-
-     Response {
-       Message string `json:"message"`
-     }
-   )
-
-   service greet-api {
-     @handler GreetHandler
-     get /greet/from/:name(Request) returns (Response)
-   }
-   ```
-
-   the .api files also can be generated by goctl, like below:
-
-   ```shell
-   goctl api -o greet.api
-   ```
-
-4. generate the go server-side code
-
-   ```shell
-   goctl api go -api greet.api -dir greet
-   ```
-
-   the generated files look like:
-
-   ```Plain Text
-   ├── greet
-   │   ├── etc
-   │   │   └── greet-api.yaml        // configuration file
-   │   ├── greet.go                  // main file
-   │   └── internal
-   │       ├── config
-   │       │   └── config.go         // configuration definition
-   │       ├── handler
-   │       │   ├── greethandler.go   // get/put/post/delete routes are defined here
-   │       │   └── routes.go         // routes list
-   │       ├── logic
-   │       │   └── greetlogic.go     // request logic can be written here
-   │       ├── svc
-   │       │   └── servicecontext.go // service context, mysql/redis can be passed in here
-   │       └── types
-   │           └── types.go          // request/response defined here
-   └── greet.api                     // api description file
-   ```
-
-   the generated code can be run directly:
-
-   ```shell
-   cd greet
-   go mod init
-   go mod tidy
-   go run greet.go -f etc/greet-api.yaml
-   ```
-
-   by default, it’s listening on port 8888, while it can be changed in the configuration file.
-
-   you can check it by curl:
-
-   ```shell
-   curl -i http://localhost:8888/greet/from/you
-   ```
-
-   the response looks like below:
-
-   ```http
-   HTTP/1.1 200 OK
-   Date: Sun, 30 Aug 2020 15:32:35 GMT
-   Content-Length: 0
-   ```
-
-5. Write the business logic code
-
-    * the dependencies can be passed into the logic within servicecontext.go, like mysql, reds, etc.
-    * add the logic code in a logic package according to .api file
-
-6. Generate code like Java, TypeScript, Dart, JavaScript, etc. just from the api file
-
-   ```shell
-   goctl api java -api greet.api -dir greet
-   goctl api dart -api greet.api -dir greet
-   ...
-   ```
-
-## Benchmark
-
-![benchmark](https://raw.githubusercontent.com/zeromicro/zero-doc/main/doc/images/benchmark.png)
-
-[Checkout the test code](https://github.com/smallnest/go-web-framework-benchmark)
-
-## Documents
-
-* [Documents](https://go-zero.dev/)
-* [Rapid development of microservice systems](https://github.com/zeromicro/zero-doc/blob/main/doc/shorturl-en.md)
-* [Rapid development of microservice systems - multiple RPCs](https://github.com/zeromicro/zero-doc/blob/main/docs/zero/bookstore-en.md)
-* [Examples](https://github.com/zeromicro/zero-examples)
-
-##  Chat group
-
-Join the chat via https://discord.gg/4JQvC5A4Fe
-
-##  Cloud Native Landscape
-
-<p float="left">
-<img src="https://landscape.cncf.io/images/left-logo.svg" width="150"/>&nbsp;&nbsp;&nbsp;
-<img src="https://landscape.cncf.io/images/right-logo.svg" width="200"/>
-</p>
-
-go-zero enlisted in the [CNCF Cloud Native Landscape](https://landscape.cncf.io/?selected=go-zero).
-
-## Give a Star! ⭐
-
-If you like or are using this project to learn or start your solution, please give it a star. Thanks!
-
-## Buy me a coffee
-
-<a href="https://www.buymeacoffee.com/kevwan" target="_blank"><img src="https://cdn.buymeacoffee.com/buttons/v2/default-yellow.png" alt="Buy Me A Coffee" style="height: 60px !important;width: 217px !important;" ></a>
+历史教训：`v1.4.5-muxi` 曾因 force push 覆盖，导致 proxy 缓存初版、生产部署拉到旧补丁。详见 Muxi-X/MuXiFresh-Be-2.0 PR #53。
