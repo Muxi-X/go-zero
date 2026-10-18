@@ -225,3 +225,17 @@ func TestWithSubEtcdAccount(t *testing.T) {
 	assert.Equal(t, user, account.User)
 	assert.Equal(t, "bar", account.Pass)
 }
+
+// TestContainer_ValueChangeKeepsKey covers the delivery order the registry uses
+// for a changed value: OnDelete removes by key, so it has to run before OnAdd,
+// otherwise the new value is removed again.
+func TestContainer_ValueChangeKeepsKey(t *testing.T) {
+	c := newContainer(false)
+	c.OnAdd(internal.KV{Key: "k", Val: "v1"})
+
+	// A value change is delivered as delete-then-add.
+	c.OnDelete(internal.KV{Key: "k", Val: "v1"})
+	c.OnAdd(internal.KV{Key: "k", Val: "v2"})
+
+	assert.Equal(t, []string{"v2"}, c.getValues())
+}

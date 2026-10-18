@@ -32,6 +32,52 @@ func init() {
 	logx.Disable()
 }
 
+// recordingListener collects the values it is told about.
+type recordingListener struct {
+	lock  sync.Mutex
+	items map[string]string
+	// beforeAdd is called before the value is recorded.
+	beforeAdd func(KV)
+	// onAdd is called after the value is recorded.
+	onAdd func(KV)
+}
+
+func newRecordingListener() *recordingListener {
+	return &recordingListener{items: make(map[string]string)}
+}
+
+func (l *recordingListener) OnAdd(kv KV) {
+	if l.beforeAdd != nil {
+		l.beforeAdd(kv)
+	}
+
+	l.lock.Lock()
+	l.items[kv.Key] = kv.Val
+	l.lock.Unlock()
+
+	if l.onAdd != nil {
+		l.onAdd(kv)
+	}
+}
+
+func (l *recordingListener) OnDelete(kv KV) {
+	l.lock.Lock()
+	delete(l.items, kv.Key)
+	l.lock.Unlock()
+}
+
+func (l *recordingListener) snapshot() map[string]string {
+	l.lock.Lock()
+	defer l.lock.Unlock()
+
+	items := make(map[string]string, len(l.items))
+	for k, v := range l.items {
+		items[k] = v
+	}
+
+	return items
+}
+
 func setMockClient(cli EtcdClient) func() {
 	mockLock.Lock()
 	NewClient = func([]string) (EtcdClient, error) {
@@ -140,7 +186,7 @@ func TestCluster_HandleChanges(t *testing.T) {
 			Key: "second",
 			Val: "2",
 		},
-	})
+	}, 1)
 	assert.EqualValues(t, map[string]string{
 		"first":  "1",
 		"second": "2",
@@ -154,11 +200,279 @@ func TestCluster_HandleChanges(t *testing.T) {
 			Key: "fourth",
 			Val: "4",
 		},
-	})
+	}, 2)
 	assert.EqualValues(t, map[string]string{
 		"third":  "3",
 		"fourth": "4",
 	}, c.values["any"])
+}
+
+// TestCluster_HandleChangesSkipsStaleSnapshot covers that a snapshot read
+// before a watch event was applied cannot revert the newer in-memory state.
+func TestCluster_HandleChangesSkipsStaleSnapshot(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	c := &cluster{
+		values: map[string]map[string]string{"any": {"k": "v2"}},
+		rev:    map[string]int64{"any": 2},
+	}
+	listener := NewMockUpdateListener(ctrl)
+	c.listeners = map[string][]UpdateListener{"any": {listener}}
+
+	// The listener has no expectations: nothing may be delivered.
+	c.handleChanges("any", []KV{{Key: "k", Val: "v1"}}, 1)
+
+	assert.Equal(t, map[string]string{"k": "v2"}, c.values["any"])
+	assert.Equal(t, int64(2), c.rev["any"])
+}
+
+// TestCluster_HandleWatchEventsAdvancesRev covers that applied watch events
+// advance the per-key revision, so a stale load snapshot is skipped.
+func TestCluster_HandleWatchEventsAdvancesRev(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	c := newCluster([]string{"watch-rev-" + stringx.Rand()})
+	listener := NewMockUpdateListener(ctrl)
+	listener.EXPECT().OnAdd(KV{Key: "k", Val: "v2"}).Times(1)
+	c.listeners["any"] = []UpdateListener{listener}
+
+	c.handleWatchEvents("any", []*clientv3.Event{{
+		Type: clientv3.EventTypePut,
+		Kv:   &mvccpb.KeyValue{Key: []byte("k"), Value: []byte("v2"), ModRevision: 5},
+	}})
+	assert.Equal(t, int64(5), c.rev["any"])
+
+	// The snapshot predates the applied event; it must be ignored entirely.
+	c.handleChanges("any", []KV{{Key: "k", Val: "v1"}}, 4)
+	assert.Equal(t, map[string]string{"k": "v2"}, c.values["any"])
+	assert.Equal(t, int64(5), c.rev["any"])
+}
+
+// TestCluster_WatchEventsReachConcurrentSubscriber covers that a subscriber
+// registered while a batch of watch events is being delivered still sees the
+// whole batch. Copying the listeners before applying the events could deliver
+// the remaining events to neither the snapshot nor the new subscriber.
+func TestCluster_WatchEventsReachConcurrentSubscriber(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := createMockConn(t)
+	defer conn.Close()
+
+	first := newRecordingListener()
+	firstAdded := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	first.onAdd = func(kv KV) {
+		if kv.Key == "k1" {
+			close(firstAdded)
+			<-releaseFirst
+		}
+	}
+
+	c := newCluster([]string{"events-" + stringx.Rand()})
+	c.lock.Lock()
+	c.listeners["any"] = []UpdateListener{first}
+	c.lock.Unlock()
+
+	eventsDone := make(chan struct{})
+	go func() {
+		c.handleWatchEvents("any", []*clientv3.Event{
+			{
+				Type: clientv3.EventTypePut,
+				Kv:   &mvccpb.KeyValue{Key: []byte("k1"), Value: []byte("v1"), ModRevision: 1},
+			},
+			{
+				Type: clientv3.EventTypePut,
+				Kv:   &mvccpb.KeyValue{Key: []byte("k2"), Value: []byte("v2"), ModRevision: 2},
+			},
+		})
+		close(eventsDone)
+	}()
+
+	select {
+	case <-firstAdded:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the first event was not delivered")
+	}
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	cli.EXPECT().Close().Return(nil).AnyTimes()
+	cli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(&clientv3.GetResponse{
+		Header: &etcdserverpb.ResponseHeader{Revision: 2},
+		Kvs: []*mvccpb.KeyValue{
+			{Key: []byte("k1"), Value: []byte("v1")},
+			{Key: []byte("k2"), Value: []byte("v2")},
+		},
+	}, nil).AnyTimes()
+	cli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).
+		Return(make(chan clientv3.WatchResponse)).AnyTimes()
+
+	newClientEntered := make(chan struct{}, 1)
+	releaseNewClient := make(chan struct{})
+	mockLock.Lock()
+	NewClient = func([]string) (EtcdClient, error) {
+		newClientEntered <- struct{}{}
+		<-releaseNewClient
+		return cli, nil
+	}
+	defer func() {
+		NewClient = DialClient
+		mockLock.Unlock()
+	}()
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, cli)
+	}()
+
+	second := newRecordingListener()
+	monitored := make(chan error, 1)
+	go func() {
+		monitored <- c.monitor("any", second)
+	}()
+
+	// While the batch is being delivered, a new subscriber cannot register: it
+	// waits for the delivery to finish, so it cannot miss the remaining events.
+	select {
+	case <-newClientEntered:
+		t.Fatal("monitor registered while a delivery was in progress")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Let the remaining events be applied and delivered to the previous
+	// listener set, then let the subscriber register and load its snapshot.
+	close(releaseFirst)
+	select {
+	case <-eventsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the watch events were not delivered")
+	}
+	select {
+	case <-newClientEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor did not reach getClient")
+	}
+
+	close(releaseNewClient)
+	select {
+	case err := <-monitored:
+		assert.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor did not return")
+	}
+
+	assert.Equal(t, map[string]string{"k1": "v1", "k2": "v2"}, second.snapshot())
+
+	close(c.currentDone())
+}
+
+// TestCluster_DeliveriesAreSerialized covers that a newer watch event cannot
+// reach a listener before an older change that is still being delivered.
+func TestCluster_DeliveriesAreSerialized(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	c := newCluster([]string{"serialize-" + stringx.Rand()})
+	c.lock.Lock()
+	c.values["any"] = map[string]string{"k": "v1"}
+	c.lock.Unlock()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	listener := newRecordingListener()
+	listener.beforeAdd = func(KV) {
+		once.Do(func() {
+			close(entered)
+			<-release
+		})
+	}
+	c.lock.Lock()
+	c.listeners["any"] = []UpdateListener{listener}
+	c.lock.Unlock()
+
+	changed := make(chan struct{})
+	go func() {
+		c.handleChanges("any", []KV{{Key: "k", Val: "v2"}}, 1)
+		close(changed)
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the change was not delivered")
+	}
+
+	// A newer event arrives while the change delivery is blocked. Deliveries
+	// are serialized, so it cannot overtake the pending OnAdd.
+	eventsDone := make(chan struct{})
+	go func() {
+		c.handleWatchEvents("any", []*clientv3.Event{{
+			Type: clientv3.EventTypeDelete,
+			Kv:   &mvccpb.KeyValue{Key: []byte("k"), ModRevision: 2},
+		}})
+		close(eventsDone)
+	}()
+
+	// Give the event time to be delivered if deliveries were not serialized.
+	time.Sleep(200 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-changed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the change delivery did not finish")
+	}
+	select {
+	case <-eventsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the event delivery did not finish")
+	}
+
+	// The later delete wins, so the listener must not keep the key.
+	assert.NotContains(t, listener.snapshot(), "k")
+}
+
+// TestCluster_LoadValueChangeKeepsKey covers that a key whose value changed is
+// delivered as delete-then-add. container.OnDelete removes by key, so the
+// opposite order would drop the new value and the subscriber would lose the
+// key until its next change.
+func TestCluster_LoadValueChangeKeepsKey(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	cli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(&clientv3.GetResponse{
+		Header: &etcdserverpb.ResponseHeader{},
+		Kvs: []*mvccpb.KeyValue{
+			{Key: []byte("k"), Value: []byte("v2")},
+		},
+	}, nil)
+
+	c := &cluster{
+		done:   make(chan lang.PlaceholderType),
+		values: map[string]map[string]string{"any": {"k": "v1"}},
+	}
+	listener := NewMockUpdateListener(ctrl)
+	c.listeners = map[string][]UpdateListener{"any": {listener}}
+
+	var order []string
+	listener.EXPECT().OnDelete(KV{Key: "k", Val: "v1"}).Do(func(KV) {
+		order = append(order, "delete")
+	})
+	listener.EXPECT().OnAdd(KV{Key: "k", Val: "v2"}).Do(func(KV) {
+		order = append(order, "add")
+	})
+
+	_, err := c.load(c.done, cli, "any")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"delete", "add"}, order)
+	assert.Equal(t, map[string]string{"k": "v2"}, c.values["any"])
 }
 
 func TestCluster_Load(t *testing.T) {

@@ -77,6 +77,13 @@ type cluster struct {
 	values     map[string]map[string]string
 	listeners  map[string][]UpdateListener
 	watchGroup *threading.RoutineGroup
+	// deliver serializes applying changes and notifying listeners, so every
+	// subscriber observes the changes in the order they were applied. Listeners
+	// must not call back into the registry from OnAdd/OnDelete.
+	deliver sync.Mutex
+	// rev holds the revision of the newest state applied to values per key, so
+	// a snapshot read earlier cannot overwrite a newer watch event.
+	rev map[string]int64
 	// done is closed when the current watcher generation is replaced, see
 	// reload. Watchers take their generation's channel as an argument instead
 	// of reading this field, so it is only accessed under lock.
@@ -98,6 +105,7 @@ func newCluster(endpoints []string) *cluster {
 		values:     make(map[string]map[string]string),
 		listeners:  make(map[string][]UpdateListener),
 		watchGroup: threading.NewRoutineGroup(),
+		rev:        make(map[string]int64),
 		done:       make(chan lang.PlaceholderType),
 		started:    make(map[string]struct{}),
 	}
@@ -118,10 +126,25 @@ func (c *cluster) getClient() (EtcdClient, error) {
 	return val.(EtcdClient), nil
 }
 
-func (c *cluster) handleChanges(key string, kvs []KV) {
+func (c *cluster) handleChanges(key string, kvs []KV, rev int64) {
+	c.deliver.Lock()
+	defer c.deliver.Unlock()
+
 	var add []KV
 	var remove []KV
 	c.lock.Lock()
+	if c.rev == nil {
+		c.rev = make(map[string]int64)
+	}
+	// A watch event applied while Get was in flight made the in-memory state
+	// newer than this snapshot. Applying the snapshot would revert the event
+	// and deliver it backwards.
+	if c.rev[key] > rev {
+		c.lock.Unlock()
+		return
+	}
+	c.rev[key] = rev
+
 	listeners := append([]UpdateListener(nil), c.listeners[key]...)
 	vals, ok := c.values[key]
 	if !ok {
@@ -156,33 +179,58 @@ func (c *cluster) handleChanges(key string, kvs []KV) {
 	}
 	c.lock.Unlock()
 
-	for _, kv := range add {
-		for _, l := range listeners {
-			l.OnAdd(kv)
-		}
-	}
+	// Delete before add: a key whose value changed appears in both lists, and
+	// container.OnDelete removes by key. Delivering the add first would remove
+	// the new value again, losing the key until its next change.
 	for _, kv := range remove {
 		for _, l := range listeners {
 			l.OnDelete(kv)
 		}
 	}
+	for _, kv := range add {
+		for _, l := range listeners {
+			l.OnAdd(kv)
+		}
+	}
 }
 
 func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
+	c.deliver.Lock()
+	defer c.deliver.Unlock()
+
+	// Apply the whole batch and copy the listeners in the same critical
+	// section. A monitor that registers concurrently either sees these values
+	// in its replay or is part of the copied listeners; updating the values
+	// after the copy could deliver an event to neither.
 	c.lock.Lock()
+	for _, ev := range events {
+		switch ev.Type {
+		case clientv3.EventTypePut:
+			if ev.Kv != nil {
+				c.advanceRev(key, ev.Kv.ModRevision)
+			}
+			if vals, ok := c.values[key]; ok {
+				vals[string(ev.Kv.Key)] = string(ev.Kv.Value)
+			} else {
+				c.values[key] = map[string]string{string(ev.Kv.Key): string(ev.Kv.Value)}
+			}
+		case clientv3.EventTypeDelete:
+			if ev.Kv != nil {
+				c.advanceRev(key, ev.Kv.ModRevision)
+			}
+			if vals, ok := c.values[key]; ok {
+				delete(vals, string(ev.Kv.Key))
+			}
+		default:
+			logx.Errorf("Unknown event type: %v", ev.Type)
+		}
+	}
 	listeners := append([]UpdateListener(nil), c.listeners[key]...)
 	c.lock.Unlock()
 
 	for _, ev := range events {
 		switch ev.Type {
 		case clientv3.EventTypePut:
-			c.lock.Lock()
-			if vals, ok := c.values[key]; ok {
-				vals[string(ev.Kv.Key)] = string(ev.Kv.Value)
-			} else {
-				c.values[key] = map[string]string{string(ev.Kv.Key): string(ev.Kv.Value)}
-			}
-			c.lock.Unlock()
 			for _, l := range listeners {
 				l.OnAdd(KV{
 					Key: string(ev.Kv.Key),
@@ -190,20 +238,24 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 				})
 			}
 		case clientv3.EventTypeDelete:
-			c.lock.Lock()
-			if vals, ok := c.values[key]; ok {
-				delete(vals, string(ev.Kv.Key))
-			}
-			c.lock.Unlock()
 			for _, l := range listeners {
 				l.OnDelete(KV{
 					Key: string(ev.Kv.Key),
 					Val: string(ev.Kv.Value),
 				})
 			}
-		default:
-			logx.Errorf("Unknown event type: %v", ev.Type)
 		}
+	}
+}
+
+// advanceRev records the revision of an applied event. The caller must hold
+// c.lock.
+func (c *cluster) advanceRev(key string, rev int64) {
+	if c.rev == nil {
+		c.rev = make(map[string]int64)
+	}
+	if rev > c.rev[key] {
+		c.rev[key] = rev
 	}
 }
 
@@ -256,7 +308,7 @@ func (c *cluster) load(done chan lang.PlaceholderType, cli EtcdClient, key strin
 		})
 	}
 
-	c.handleChanges(key, kvs)
+	c.handleChanges(key, kvs, resp.Header.Revision)
 
 	return resp.Header.Revision, nil
 }
@@ -325,20 +377,7 @@ func errorCode(err error) codes.Code {
 }
 
 func (c *cluster) monitor(key string, l UpdateListener) error {
-	func() {
-		c.lock.Lock()
-		defer c.lock.Unlock()
-
-		c.listeners[key] = append(c.listeners[key], l)
-		// Replay the current values under the same lock that registers the
-		// listener: an event delivered between a snapshot taken here and a
-		// replay done afterwards could otherwise be overwritten by the older
-		// snapshot. Listeners must not call back into the registry (e.g.
-		// NewSubscriber) from OnAdd, or this deadlocks.
-		for k, v := range c.values[key] {
-			l.OnAdd(KV{Key: k, Val: v})
-		}
-	}()
+	c.registerListener(key, l)
 
 	cli, err := c.getClient()
 	if err != nil {
@@ -369,6 +408,24 @@ func (c *cluster) monitor(key string, l UpdateListener) error {
 		if c.startWatch(done, cli, key, rev) {
 			return nil
 		}
+	}
+}
+
+// registerListener adds l to key and replays the current values. Both happen
+// under the delivery lock, so a concurrent event is either applied before the
+// replay or delivered to the registered listener, never missed in between.
+// Listeners must not call back into the registry (e.g. NewSubscriber) from
+// OnAdd, or this deadlocks.
+func (c *cluster) registerListener(key string, l UpdateListener) {
+	c.deliver.Lock()
+	defer c.deliver.Unlock()
+
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	c.listeners[key] = append(c.listeners[key], l)
+	for k, v := range c.values[key] {
+		l.OnAdd(KV{Key: k, Val: v})
 	}
 }
 
