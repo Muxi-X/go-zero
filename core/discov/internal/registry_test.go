@@ -2,6 +2,8 @@ package internal
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -16,9 +18,12 @@ import (
 	"github.com/zeromicro/go-zero/core/stringx"
 	"go.etcd.io/etcd/api/v3/etcdserverpb"
 	"go.etcd.io/etcd/api/v3/mvccpb"
+	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 var mockLock sync.Mutex
@@ -285,6 +290,144 @@ func TestClusterWatch_CloseChan(t *testing.T) {
 		close(c.done)
 	}()
 	c.watch(cli, "any", 0)
+}
+
+// TestClusterWatch_CompactedRevisionKeepsClient covers the shared-client
+// protection: a compacted revision is a watch-specific failure, not a broken
+// client. The watcher must reload the revision instead of invalidating the
+// cached client, which is shared by every watcher and publisher on the same
+// endpoints.
+func TestClusterWatch_CompactedRevisionKeepsClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	conn := createMockConn(t)
+	defer conn.Close()
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	// The client is healthy, so it must not be closed.
+	cli.EXPECT().Close().Times(0)
+
+	watchCh := make(chan clientv3.WatchResponse)
+	cli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(watchCh).AnyTimes()
+
+	reloaded := make(chan struct{})
+	cli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			select {
+			case <-reloaded:
+			default:
+				close(reloaded)
+			}
+			return &clientv3.GetResponse{Header: &etcdserverpb.ResponseHeader{}}, nil
+		}).AnyTimes()
+
+	restore := setMockClients(cli)
+	defer restore()
+
+	c := new(cluster)
+	c.endpoints = []string{"compacted-" + stringx.Rand()}
+	c.key = getClusterKey(c.endpoints)
+	c.done = make(chan lang.PlaceholderType)
+	c.listeners = make(map[string][]UpdateListener)
+	c.values = make(map[string]map[string]string)
+
+	// Cache the client the way monitor() does, so that a wrongful
+	// invalidation would remove and close it.
+	if _, err := c.getClient(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.watch(cli, "any", 10)
+		close(done)
+	}()
+
+	watchCh <- clientv3.WatchResponse{Canceled: true, CompactRevision: 1}
+
+	select {
+	case <-reloaded:
+	case <-time.After(5 * time.Second):
+		t.Fatal("watch did not reload the revision after a compacted response")
+	}
+
+	close(c.done)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not exit")
+	}
+}
+
+// TestShouldInvalidateConn covers which watch failures replace the client.
+// Only a closed client or an expired auth token requires a new client; other
+// failures must keep the shared client alive.
+func TestShouldInvalidateConn(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	aliveCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	alive := NewMockEtcdClient(ctrl)
+	alive.EXPECT().Ctx().Return(aliveCtx).AnyTimes()
+
+	deadCtx, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	dead := NewMockEtcdClient(ctrl)
+	dead.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+
+	tests := []struct {
+		name string
+		cli  EtcdClient
+		err  error
+		want bool
+	}{
+		{
+			name: "expired auth token",
+			cli:  alive,
+			// The shape produced by clientv3's WatchResponse.Err() for a
+			// stream that failed to authenticate.
+			err: fmt.Errorf("etcd monitor chan has been canceled, error: %w",
+				rpctypes.Error(status.Error(codes.Unauthenticated, "etcdserver: invalid auth token"))),
+			want: true,
+		},
+		{
+			name: "closed client",
+			cli:  dead,
+			err:  errors.New("etcd monitor chan has been closed"),
+			want: true,
+		},
+		{
+			name: "compacted revision",
+			cli:  alive,
+			err:  rpctypes.ErrCompacted,
+			want: false,
+		},
+		{
+			name: "future revision",
+			cli:  alive,
+			err:  rpctypes.ErrFutureRev,
+			want: false,
+		},
+		{
+			name: "permission denied",
+			cli:  alive,
+			err:  rpctypes.ErrPermissionDenied,
+			want: false,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assert.Equal(t, test.want, shouldInvalidateConn(test.cli, test.err))
+		})
+	}
 }
 
 // TestCluster_LoadOnClosedClientReturns covers the load() fix: when the client

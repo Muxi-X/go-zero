@@ -2,6 +2,7 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -14,6 +15,7 @@ import (
 	"github.com/zeromicro/go-zero/core/logx"
 	"github.com/zeromicro/go-zero/core/syncx"
 	"github.com/zeromicro/go-zero/core/threading"
+	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
 
@@ -322,9 +324,11 @@ func (c *cluster) reload() {
 
 func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 	for {
-		if c.watchStream(cli, key, rev) {
+		err := c.watchStream(cli, key, rev)
+		if err == nil {
 			return
 		}
+		logx.Errorf("etcd monitor chan exited: %v", err)
 
 		select {
 		case <-c.done:
@@ -333,19 +337,26 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		}
 
 		// [Muxi Patch]
-		// clientv3 does not refresh the auth token on watch streams (#12385),
-		// so a long-lived watch fails with "invalid auth token" once the token
-		// expires. Remove the cached client so the next getClient() lazily
-		// creates a fresh one (with a new token). Single-flight guarantees
-		// only one client is recreated even when multiple watchers fail
-		// together. Removal is conditional on cli: a concurrent watcher may
-		// have already replaced the cached client, and closing that fresh
-		// client would disrupt it for no reason. Retry with a cooldown to
-		// avoid a tight loop.
-		logx.Errorf("etcd monitor chan exited, invalidate client and retry in %v", coolDownInterval)
-		if err := connManager.RemoveResourceIf(c.key, cli); err != nil {
-			logx.Errorf("remove etcd client resource: %v", err)
+		// A watch fails with "invalid auth token" once the auth token expires,
+		// and clientv3 never refreshes the token of a long-lived stream
+		// (#12385), so the client has to be replaced to recover. Other
+		// failures (e.g. a compacted revision) are not the client's fault, and
+		// the client is shared by every watcher and publisher on the same
+		// endpoints, so closing it would interrupt healthy streams for no
+		// reason; reloading the revision is enough to recover from them.
+		//
+		// Removal is conditional on cli: a concurrent watcher may have already
+		// replaced the cached client, and closing that fresh client would
+		// disrupt it for no reason. Single-flight guarantees only one client
+		// is recreated even when multiple watchers fail together.
+		invalidate := shouldInvalidateConn(cli, err)
+		if invalidate {
+			if err := connManager.RemoveResourceIf(c.key, cli); err != nil {
+				logx.Errorf("remove etcd client resource: %v", err)
+			}
 		}
+
+		// Retry with a cooldown to avoid a tight loop.
 		timer := time.NewTimer(coolDownInterval)
 		select {
 		case <-timer.C:
@@ -354,26 +365,42 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 			return
 		}
 
-		newCli, err := c.getClient()
-		if err != nil {
-			logx.Errorf("recreate etcd client: %v", err)
-			continue
+		if invalidate {
+			newCli, err := c.getClient()
+			if err != nil {
+				logx.Errorf("recreate etcd client: %v", err)
+				continue
+			}
+			if newCli.Ctx().Err() != nil {
+				// The freshly created client may have been closed by another
+				// failing source (e.g. a concurrent watcher or the publisher's
+				// InvalidateConn) racing with this recreation. load() would then
+				// retry forever on the closed client, so bail out and redo the
+				// whole invalidation+recreation cycle.
+				logx.Errorf("etcd client invalidated during recreation, retry")
+				continue
+			}
+			cli = newCli
 		}
-		if newCli.Ctx().Err() != nil {
-			// The freshly created client may have been closed by another
-			// failing source (e.g. a concurrent watcher or the publisher's
-			// InvalidateConn) racing with this recreation. load() would then
-			// retry forever on the closed client, so bail out and redo the
-			// whole invalidation+recreation cycle.
-			logx.Errorf("etcd client invalidated during recreation, retry")
-			continue
-		}
-		cli = newCli
+
 		rev = c.load(cli, key)
 	}
 }
 
-func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) bool {
+// shouldInvalidateConn reports whether a failed watch means that the client
+// itself is unusable and has to be replaced instead of reused. That is the
+// case when the client has already been closed, or when its auth token has
+// expired: clientv3 does not refresh the token of a long-lived watch stream
+// (see https://github.com/etcd-io/etcd/issues/12385).
+func shouldInvalidateConn(cli EtcdClient, err error) bool {
+	if cli.Ctx().Err() != nil {
+		return true
+	}
+
+	return errors.Is(err, rpctypes.ErrInvalidAuthToken)
+}
+
+func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) error {
 	var rch clientv3.WatchChan
 	if rev != 0 {
 		rch = cli.Watch(clientv3.WithRequireLeader(c.context(cli)), makeKeyPrefix(key), clientv3.WithPrefix(),
@@ -386,21 +413,18 @@ func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) bool {
 		select {
 		case wresp, ok := <-rch:
 			if !ok {
-				logx.Error("etcd monitor chan has been closed")
-				return false
+				return errors.New("etcd monitor chan has been closed")
 			}
 			if wresp.Canceled {
-				logx.Errorf("etcd monitor chan has been canceled, error: %v", wresp.Err())
-				return false
+				return fmt.Errorf("etcd monitor chan has been canceled, error: %w", wresp.Err())
 			}
-			if wresp.Err() != nil {
-				logx.Error(fmt.Sprintf("etcd monitor chan error: %v", wresp.Err()))
-				return false
+			if err := wresp.Err(); err != nil {
+				return fmt.Errorf("etcd monitor chan error: %w", err)
 			}
 
 			c.handleWatchEvents(key, wresp.Events)
 		case <-c.done:
-			return true
+			return nil
 		}
 	}
 }

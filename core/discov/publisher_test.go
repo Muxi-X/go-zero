@@ -208,8 +208,14 @@ func TestPublisher_keepAliveAsyncRefreshesClient(t *testing.T) {
 
 	firstKeepAliveChan := make(chan *clientv3.LeaseKeepAliveResponse)
 	secondKeepAliveChan := make(chan *clientv3.LeaseKeepAliveResponse)
+	// The cached clients start state watchers that exit on ctx cancellation,
+	// so each mock client needs a cancellable context.
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	defer cancelFirst()
+	secondCtx, cancelSecond := context.WithCancel(context.Background())
+	defer cancelSecond()
 
-	firstCli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	firstCli.EXPECT().Ctx().Return(firstCtx).AnyTimes()
 	firstCli.EXPECT().ActiveConnection().Return(firstConn).AnyTimes()
 	firstCli.EXPECT().Grant(gomock.Any(), timeToLive).Return(&clientv3.LeaseGrantResponse{
 		ID: firstLease,
@@ -223,7 +229,7 @@ func TestPublisher_keepAliveAsyncRefreshesClient(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	secondKeepAliveStarted := make(chan struct{})
-	secondCli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	secondCli.EXPECT().Ctx().Return(secondCtx).AnyTimes()
 	secondCli.EXPECT().ActiveConnection().Return(secondConn).AnyTimes()
 	secondCli.EXPECT().Grant(gomock.Any(), timeToLive).Return(&clientv3.LeaseGrantResponse{
 		ID: secondLease,
@@ -253,4 +259,74 @@ func TestPublisher_keepAliveAsyncRefreshesClient(t *testing.T) {
 	pub.Stop()
 	wg.Wait()
 	assert.NoError(t, internal.GetRegistry().InvalidateConn(endpoints, secondCli))
+}
+
+// TestPublisher_ResumeKeepsSharedClient covers that resuming a publisher
+// reuses the cached etcd client. Invalidating it on resume would close the
+// client shared by every watcher and publisher on the same endpoints, so a
+// Close call would fail this test as unexpected.
+func TestPublisher_ResumeKeepsSharedClient(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const lease clientv3.LeaseID = 1
+
+	cli := internal.NewMockEtcdClient(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	conn := createMockConn(t)
+	defer conn.Close()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+
+	firstCh := make(chan *clientv3.LeaseKeepAliveResponse)
+	secondCh := make(chan *clientv3.LeaseKeepAliveResponse)
+	resumed := make(chan struct{})
+	revoked := make(chan struct{}, 4)
+	cli.EXPECT().Grant(gomock.Any(), timeToLive).Return(&clientv3.LeaseGrantResponse{
+		ID: lease,
+	}, nil).Times(2)
+	cli.EXPECT().Put(gomock.Any(), gomock.Any(), "thevalue", gomock.Any()).Times(2)
+	gomock.InOrder(
+		cli.EXPECT().KeepAlive(gomock.Any(), lease).Return(firstCh, nil),
+		cli.EXPECT().KeepAlive(gomock.Any(), lease).DoAndReturn(func(context.Context,
+			clientv3.LeaseID) (<-chan *clientv3.LeaseKeepAliveResponse, error) {
+			close(resumed)
+			return secondCh, nil
+		}),
+	)
+	cli.EXPECT().Revoke(gomock.Any(), lease).DoAndReturn(func(context.Context,
+		clientv3.LeaseID) (*clientv3.LeaseRevokeResponse, error) {
+		revoked <- struct{}{}
+		return &clientv3.LeaseRevokeResponse{}, nil
+	}).AnyTimes()
+
+	restore := setMockClient(cli)
+	defer restore()
+
+	pub := NewPublisher([]string{"resume-" + stringx.Rand()}, "thekey", "thevalue")
+	assert.Nil(t, pub.KeepAlive())
+
+	pub.Pause()
+	pub.Resume()
+
+	select {
+	case <-resumed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the publisher to resume")
+	}
+
+	select {
+	case <-revoked: // the lease revoked on pause
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for the pause to revoke the lease")
+	}
+
+	pub.Stop()
+
+	select {
+	case <-revoked: // the lease revoked on stop
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for stop to revoke the lease")
+	}
 }
