@@ -209,8 +209,7 @@ func TestCluster_Watch(t *testing.T) {
 			ch := make(chan clientv3.WatchResponse)
 			cli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(ch)
 			cli.EXPECT().Ctx().Return(context.Background())
-			var wg sync.WaitGroup
-			wg.Add(1)
+			handled := make(chan struct{}, 1)
 			c := &cluster{
 				listeners: make(map[string][]UpdateListener),
 				values:    make(map[string]map[string]string),
@@ -220,10 +219,10 @@ func TestCluster_Watch(t *testing.T) {
 			listener.EXPECT().OnAdd(gomock.Any()).Do(func(kv KV) {
 				assert.Equal(t, "hello", kv.Key)
 				assert.Equal(t, "world", kv.Val)
-				wg.Done()
+				handled <- struct{}{}
 			}).MaxTimes(1)
 			listener.EXPECT().OnDelete(gomock.Any()).Do(func(_ interface{}) {
-				wg.Done()
+				handled <- struct{}{}
 			}).MaxTimes(1)
 			go c.watch(cli, "any", 0)
 			ch <- clientv3.WatchResponse{
@@ -237,7 +236,11 @@ func TestCluster_Watch(t *testing.T) {
 					},
 				},
 			}
-			wg.Wait()
+			select {
+			case <-handled:
+			case <-time.After(2 * time.Second):
+				t.Fatal("timed out waiting for the watch event")
+			}
 		})
 	}
 }
@@ -395,6 +398,20 @@ func TestShouldInvalidateConn(t *testing.T) {
 			// stream that failed to authenticate.
 			err: fmt.Errorf("etcd monitor chan has been canceled, error: %w",
 				rpctypes.Error(status.Error(codes.Unauthenticated, "etcdserver: invalid auth token"))),
+			want: true,
+		},
+		{
+			name: "stale auth revision",
+			cli:  alive,
+			err: fmt.Errorf("etcd monitor chan has been canceled, error: %w",
+				rpctypes.Error(status.Error(codes.InvalidArgument, "etcdserver: revision of auth store is old"))),
+			want: true,
+		},
+		{
+			name: "empty user",
+			cli:  alive,
+			err: fmt.Errorf("etcd monitor chan has been canceled, error: %w",
+				rpctypes.Error(status.Error(codes.InvalidArgument, "etcdserver: user name is empty"))),
 			want: true,
 		},
 		{
@@ -574,4 +591,166 @@ func TestClusterWatch_RecreatedClientInvalidated(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("watch did not exit")
 	}
+}
+
+// TestClusterWatch_DeadRecreatedClientRemoved covers the guard's recovery
+// path: when the recreated client has already been closed by another source,
+// watch() switches to it and invalidates it by identity on the next round.
+// Retrying with the previous client would never match the cached one, leaving
+// the dead client in the cache forever.
+func TestClusterWatch_DeadRecreatedClientRemoved(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	firstCtx, cancelFirst := context.WithCancel(context.Background())
+	cancelFirst()
+	deadCtx, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	aliveCtx, cancelAlive := context.WithCancel(context.Background())
+	defer cancelAlive()
+
+	conn := createMockConn(t)
+	defer conn.Close()
+
+	// The initial client fails the watch and gets invalidated.
+	firstCli := NewMockEtcdClient(ctrl)
+	firstCli.EXPECT().Ctx().Return(firstCtx).AnyTimes()
+	firstFailures := make(chan clientv3.WatchResponse, 2)
+	firstFailures <- clientv3.WatchResponse{Canceled: true}
+	firstFailures <- clientv3.WatchResponse{Canceled: true}
+	firstCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(firstFailures).AnyTimes()
+
+	// The first recreation returns a client that has already been closed, so
+	// it has to be removed by identity on the next round.
+	deadCli := NewMockEtcdClient(ctrl)
+	deadCli.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+	deadCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	closedWatch := make(chan clientv3.WatchResponse)
+	close(closedWatch)
+	deadCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(closedWatch).AnyTimes()
+	deadCli.EXPECT().Close().Return(nil).Times(1)
+
+	// The second recreation is live and must be used.
+	aliveCli := NewMockEtcdClient(ctrl)
+	aliveCli.EXPECT().Ctx().Return(aliveCtx).AnyTimes()
+	aliveCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	aliveWatch := make(chan clientv3.WatchResponse)
+	aliveCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(aliveWatch).AnyTimes()
+
+	loaded := make(chan struct{})
+	aliveCli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			select {
+			case <-loaded:
+			default:
+				close(loaded)
+			}
+			return &clientv3.GetResponse{Header: &etcdserverpb.ResponseHeader{}}, nil
+		}).AnyTimes()
+
+	restore := setMockClients(deadCli, aliveCli)
+	defer restore()
+
+	c := new(cluster)
+	c.endpoints = []string{"dead-recreated-" + stringx.Rand()}
+	c.key = getClusterKey(c.endpoints)
+	c.done = make(chan lang.PlaceholderType)
+	c.listeners = make(map[string][]UpdateListener)
+	c.values = make(map[string]map[string]string)
+
+	done := make(chan struct{})
+	go func() {
+		c.watch(firstCli, "any", 0)
+		close(done)
+	}()
+
+	select {
+	case <-loaded:
+	case <-time.After(6 * time.Second):
+		t.Fatal("watch did not recover from the closed recreated client")
+	}
+
+	close(c.done)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not exit")
+	}
+}
+
+// TestClusterWatch_ConcurrentInvalidation covers the shared-client property:
+// when several watchers fail on the same cached client together, only one of
+// them removes and closes it, and all of them continue on the single recreated
+// client.
+func TestClusterWatch_ConcurrentInvalidation(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	const watchers = 3
+
+	deadCtx, cancelDead := context.WithCancel(context.Background())
+	cancelDead()
+	aliveCtx, cancelAlive := context.WithCancel(context.Background())
+	defer cancelAlive()
+
+	conn := createMockConn(t)
+	defer conn.Close()
+
+	deadCli := NewMockEtcdClient(ctrl)
+	deadCli.EXPECT().Ctx().Return(deadCtx).AnyTimes()
+	deadCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	closedWatch := make(chan clientv3.WatchResponse)
+	close(closedWatch)
+	deadCli.EXPECT().Watch(gomock.Any(), gomock.Any(), gomock.Any()).Return(closedWatch).AnyTimes()
+	// Only the watcher that still sees the client cached removes it.
+	deadCli.EXPECT().Close().Return(nil).Times(1)
+
+	aliveCli := NewMockEtcdClient(ctrl)
+	aliveCli.EXPECT().Ctx().Return(aliveCtx).AnyTimes()
+	aliveCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	aliveWatch := make(chan clientv3.WatchResponse)
+	aliveCli.EXPECT().Watch(gomock.Any(), gomock.Any(), gomock.Any()).Return(aliveWatch).AnyTimes()
+
+	loaded := make(chan struct{}, watchers)
+	aliveCli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			loaded <- struct{}{}
+			return &clientv3.GetResponse{Header: &etcdserverpb.ResponseHeader{}}, nil
+		}).Times(watchers)
+
+	restore := setMockClients(deadCli, aliveCli)
+	defer restore()
+
+	c := new(cluster)
+	c.endpoints = []string{"concurrent-" + stringx.Rand()}
+	c.key = getClusterKey(c.endpoints)
+	c.done = make(chan lang.PlaceholderType)
+	c.listeners = make(map[string][]UpdateListener)
+	c.values = make(map[string]map[string]string)
+
+	// Cache the client the way monitor() does.
+	if _, err := c.getClient(); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(watchers)
+	for i := 0; i < watchers; i++ {
+		key := fmt.Sprintf("key-%d", i)
+		go func() {
+			defer wg.Done()
+			c.watch(deadCli, key, 0)
+		}()
+	}
+
+	for i := 0; i < watchers; i++ {
+		select {
+		case <-loaded:
+		case <-time.After(6 * time.Second):
+			t.Fatal("timed out waiting for the watchers to use the recreated client")
+		}
+	}
+
+	close(c.done)
+	wg.Wait()
 }

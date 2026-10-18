@@ -337,13 +337,19 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		}
 
 		// [Muxi Patch]
-		// A watch fails with "invalid auth token" once the auth token expires,
-		// and clientv3 never refreshes the token of a long-lived stream
-		// (#12385), so the client has to be replaced to recover. Other
-		// failures (e.g. a compacted revision) are not the client's fault, and
-		// the client is shared by every watcher and publisher on the same
-		// endpoints, so closing it would interrupt healthy streams for no
-		// reason; reloading the revision is enough to recover from them.
+		// A long-lived watch fails with "invalid auth token" once the auth
+		// token expires. Rebuilding the stream on the same client does not
+		// always recover: clientv3 re-authenticates when it creates a stream,
+		// but getToken sends the current (expired) token along with the
+		// Authenticate call, and servers without etcd-io/etcd#12165 reject
+		// it. On such servers only a new client, whose token bundle is empty,
+		// can authenticate again.
+		//
+		// Other failures (e.g. a compacted revision) are not the client's
+		// fault, and the client is shared by every watcher and publisher on
+		// the same endpoints, so closing it would interrupt healthy streams
+		// for no reason; reloading the revision is enough to recover from
+		// them.
 		//
 		// Removal is conditional on cli: a concurrent watcher may have already
 		// replaced the cached client, and closing that fresh client would
@@ -371,16 +377,17 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 				logx.Errorf("recreate etcd client: %v", err)
 				continue
 			}
+			// Switch to the new client before checking it: if it has been
+			// closed by another failing source (e.g. a concurrent watcher or
+			// the publisher's InvalidateConn) racing with this recreation, the
+			// next round has to invalidate this very client by identity.
+			// Retrying with the previous client would never match the cached
+			// one, leaving the dead client in the cache.
+			cli = newCli
 			if newCli.Ctx().Err() != nil {
-				// The freshly created client may have been closed by another
-				// failing source (e.g. a concurrent watcher or the publisher's
-				// InvalidateConn) racing with this recreation. load() would then
-				// retry forever on the closed client, so bail out and redo the
-				// whole invalidation+recreation cycle.
 				logx.Errorf("etcd client invalidated during recreation, retry")
 				continue
 			}
-			cli = newCli
 		}
 
 		rev = c.load(cli, key)
@@ -389,15 +396,24 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 
 // shouldInvalidateConn reports whether a failed watch means that the client
 // itself is unusable and has to be replaced instead of reused. That is the
-// case when the client has already been closed, or when its auth token has
-// expired: clientv3 does not refresh the token of a long-lived watch stream
-// (see https://github.com/etcd-io/etcd/issues/12385).
+// case when the client has already been closed, or when the server no longer
+// accepts its credentials, which a stream rebuilt on the same client cannot
+// fix (see the [Muxi Patch] comment in watch()).
 func shouldInvalidateConn(cli EtcdClient, err error) bool {
 	if cli.Ctx().Err() != nil {
 		return true
 	}
 
-	return errors.Is(err, rpctypes.ErrInvalidAuthToken)
+	return isAuthError(err)
+}
+
+// isAuthError reports whether err means the client's credentials are no longer
+// accepted by the server. clientv3 refreshes the token for the same set of
+// errors in Client.shouldRefreshToken.
+func isAuthError(err error) bool {
+	return errors.Is(err, rpctypes.ErrInvalidAuthToken) ||
+		errors.Is(err, rpctypes.ErrAuthOldRevision) ||
+		errors.Is(err, rpctypes.ErrUserEmpty)
 }
 
 func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) error {
