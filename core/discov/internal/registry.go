@@ -17,6 +17,8 @@ import (
 	"github.com/zeromicro/go-zero/core/threading"
 	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 var (
@@ -83,8 +85,18 @@ type cluster struct {
 	values     map[string]map[string]string
 	listeners  map[string][]UpdateListener
 	watchGroup *threading.RoutineGroup
-	done       chan lang.PlaceholderType
-	lock       sync.Mutex
+	// done is closed when the current watcher generation is replaced, see
+	// reload. Watchers take their generation's channel as an argument instead
+	// of reading this field, so it is only accessed under lock.
+	done chan lang.PlaceholderType
+	// started holds the keys that already have a watcher in the current
+	// generation, so a concurrent reload and monitor do not start two watchers
+	// for the same key.
+	started map[string]struct{}
+	lock    sync.Mutex
+	// reloadLock serializes generations. Two concurrent reloads would
+	// otherwise close the same channel and start duplicate watchers.
+	reloadLock sync.Mutex
 }
 
 func newCluster(endpoints []string) *cluster {
@@ -95,6 +107,7 @@ func newCluster(endpoints []string) *cluster {
 		listeners:  make(map[string][]UpdateListener),
 		watchGroup: threading.NewRoutineGroup(),
 		done:       make(chan lang.PlaceholderType),
+		started:    make(map[string]struct{}),
 	}
 }
 
@@ -217,25 +230,25 @@ func (c *cluster) handleWatchEvents(key string, events []*clientv3.Event) {
 	}
 }
 
-func (c *cluster) load(cli EtcdClient, key string) int64 {
+func (c *cluster) load(done chan lang.PlaceholderType, cli EtcdClient, key string) (int64, error) {
 	var resp *clientv3.GetResponse
 	for {
 		select {
-		case <-c.done:
-			return 0
+		case <-done:
+			return 0, nil
 		default:
 		}
 
 		// [Muxi Patch]
 		// A client with a canceled context has been closed (e.g. by another
 		// watcher's RemoveResourceIf, or the publisher's InvalidateConn). Get on
-		// it can never succeed, and this loop has no exit other than c.done —
-		// which is only closed on a connection-state change, not on token
+		// it can never succeed, and this loop has no exit other than the
+		// watcher generation being replaced, which is not triggered by token
 		// expiry. Without this check load() would spin forever on the dead
 		// client, leaving the key's watcher stuck and the service on stale
 		// addresses. Return instead so watch() can recreate the client.
 		if cli.Ctx().Err() != nil {
-			return 0
+			return 0, nil
 		}
 
 		var err error
@@ -245,9 +258,17 @@ func (c *cluster) load(cli EtcdClient, key string) int64 {
 		if err == nil {
 			break
 		}
+		// A retry can never succeed for errors like a missing read permission,
+		// so report them instead of retrying forever. monitor() surfaces them
+		// to the subscriber, watch() keeps retrying with a cooldown.
+		if isTerminalGetError(err) {
+			return 0, err
+		}
 
 		logx.Error(err)
-		time.Sleep(coolDownInterval)
+		if !c.wait(done) {
+			return 0, nil
+		}
 	}
 
 	var kvs []KV
@@ -260,7 +281,41 @@ func (c *cluster) load(cli EtcdClient, key string) int64 {
 
 	c.handleChanges(key, kvs)
 
-	return resp.Header.Revision
+	return resp.Header.Revision, nil
+}
+
+// wait cools down before the next attempt, and reports whether the watcher
+// generation is still alive.
+func (c *cluster) wait(done chan lang.PlaceholderType) bool {
+	timer := time.NewTimer(coolDownInterval)
+	select {
+	case <-timer.C:
+		return true
+	case <-done:
+		timer.Stop()
+		return false
+	}
+}
+
+// isTerminalGetError reports whether a failed Get can never succeed by
+// retrying, e.g. when the credentials or the permissions are wrong. Transient
+// failures, such as an unavailable cluster, are retried.
+func isTerminalGetError(err error) bool {
+	switch errorCode(err) {
+	case codes.InvalidArgument, codes.Unauthenticated, codes.PermissionDenied:
+		return true
+	default:
+		return false
+	}
+}
+
+func errorCode(err error) codes.Code {
+	var coder interface{ Code() codes.Code }
+	if errors.As(err, &coder) {
+		return coder.Code()
+	}
+
+	return status.Code(err)
 }
 
 func (c *cluster) monitor(key string, l UpdateListener) error {
@@ -270,15 +325,73 @@ func (c *cluster) monitor(key string, l UpdateListener) error {
 
 	cli, err := c.getClient()
 	if err != nil {
+		c.removeListener(key, l)
 		return err
 	}
 
-	rev := c.load(cli, key)
+	// load() notifies the listener about the current values, and startWatch()
+	// only accepts the generation that load() ran against. When a reload wins
+	// the race, load() returns at once and the snapshot is taken again in the
+	// new generation, so the key never misses its watcher or its values.
+	for {
+		done := c.currentDone()
+		rev, err := c.load(done, cli, key)
+		if err != nil {
+			c.removeListener(key, l)
+			return err
+		}
+
+		if c.startWatch(done, cli, key, rev) {
+			return nil
+		}
+	}
+}
+
+// removeListener drops l from the listeners of key, so a failed monitor leaves
+// no orphan listener behind and a retried NewSubscriber receives no duplicate
+// events.
+func (c *cluster) removeListener(key string, l UpdateListener) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	listeners := c.listeners[key]
+	for i, item := range listeners {
+		if item == l {
+			c.listeners[key] = append(listeners[:i], listeners[i+1:]...)
+			return
+		}
+	}
+}
+
+func (c *cluster) currentDone() chan lang.PlaceholderType {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	return c.done
+}
+
+// startWatch starts a watcher for key in the given generation. It reports
+// whether that generation was still the current one when the watcher was
+// registered. When it was, the key ends up with exactly one watcher, because
+// reload marks every key it covers before it starts them.
+func (c *cluster) startWatch(done chan lang.PlaceholderType, cli EtcdClient, key string, rev int64) bool {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+
+	if c.done != done {
+		return false
+	}
+
+	if _, ok := c.started[key]; ok {
+		return true
+	}
+
+	c.started[key] = struct{}{}
 	c.watchGroup.Run(func() {
-		c.watch(cli, key, rev)
+		c.watch(done, cli, key, rev)
 	})
 
-	return nil
+	return true
 }
 
 func (c *cluster) newClient() (EtcdClient, error) {
@@ -293,6 +406,9 @@ func (c *cluster) newClient() (EtcdClient, error) {
 }
 
 func (c *cluster) reload() {
+	c.reloadLock.Lock()
+	defer c.reloadLock.Unlock()
+
 	// always use the currently cached client from the connection manager,
 	// otherwise a stale (closed) client could be used to reload. Since
 	// RemoveResourceIf atomically deletes before closing, the cache never
@@ -302,48 +418,70 @@ func (c *cluster) reload() {
 		return
 	}
 
+	// Swap the generation under the lock, but wait for the previous one
+	// outside of it: watchers take c.lock in handleChanges/handleWatchEvents,
+	// so waiting with the lock held deadlocks with them.
 	c.lock.Lock()
-	close(c.done)
-	c.watchGroup.Wait()
-	c.done = make(chan lang.PlaceholderType)
-	c.watchGroup = threading.NewRoutineGroup()
+	oldDone := c.done
+	oldGroup := c.watchGroup
+	done := make(chan lang.PlaceholderType)
+	group := threading.NewRoutineGroup()
+	c.done = done
+	c.watchGroup = group
+	c.started = make(map[string]struct{}, len(c.listeners))
 	var keys []string
 	for k := range c.listeners {
 		keys = append(keys, k)
+		c.started[k] = struct{}{}
 	}
 	c.lock.Unlock()
 
+	close(oldDone)
+	oldGroup.Wait()
+
 	for _, key := range keys {
 		k := key
-		c.watchGroup.Run(func() {
-			rev := c.load(cli, k)
-			c.watch(cli, k, rev)
+		group.Run(func() {
+			for {
+				rev, err := c.load(done, cli, k)
+				if err == nil {
+					c.watch(done, cli, k, rev)
+					return
+				}
+
+				// Retrying the load keeps the snapshot gap-free: watching from
+				// 0 after the error is cleared would skip every change made
+				// while it persisted.
+				logx.Error(err)
+				if !c.wait(done) {
+					return
+				}
+			}
 		})
 	}
 }
 
-func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
+func (c *cluster) watch(done chan lang.PlaceholderType, cli EtcdClient, key string, rev int64) {
 	for {
-		err := c.watchStream(cli, key, rev)
+		err := c.watchStream(done, cli, key, rev)
 		if err == nil {
 			return
 		}
 		logx.Errorf("etcd monitor chan exited: %v", err)
 
 		select {
-		case <-c.done:
+		case <-done:
 			return
 		default:
 		}
 
 		// [Muxi Patch]
 		// A long-lived watch fails with "invalid auth token" once the auth
-		// token expires. Rebuilding the stream on the same client does not
-		// always recover: clientv3 re-authenticates when it creates a stream,
-		// but getToken sends the current (expired) token along with the
-		// Authenticate call, and servers without etcd-io/etcd#12165 reject
-		// it. On such servers only a new client, whose token bundle is empty,
-		// can authenticate again.
+		// token expires. Rebuilding the stream is not always enough: clientv3
+		// re-authenticates when it creates a stream, but getToken sends the
+		// current (expired) token along with the Authenticate call, and
+		// servers without etcd-io/etcd#12165 reject it. Replacing the client
+		// resets its token bundle, which forces a full re-authentication.
 		//
 		// Other failures (e.g. a compacted revision) are not the client's
 		// fault, and the client is shared by every watcher and publisher on
@@ -363,11 +501,7 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 		}
 
 		// Retry with a cooldown to avoid a tight loop.
-		timer := time.NewTimer(coolDownInterval)
-		select {
-		case <-timer.C:
-		case <-c.done:
-			timer.Stop()
+		if !c.wait(done) {
 			return
 		}
 
@@ -390,7 +524,17 @@ func (c *cluster) watch(cli EtcdClient, key string, rev int64) {
 			}
 		}
 
-		rev = c.load(cli, key)
+		newRev, err := c.load(done, cli, key)
+		if err != nil {
+			// Keep the last good revision. Watching from 0 after the error is
+			// cleared would silently skip every change made during the outage.
+			logx.Error(err)
+			if !c.wait(done) {
+				return
+			}
+			continue
+		}
+		rev = newRev
 	}
 }
 
@@ -416,7 +560,7 @@ func isAuthError(err error) bool {
 		errors.Is(err, rpctypes.ErrUserEmpty)
 }
 
-func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) error {
+func (c *cluster) watchStream(done chan lang.PlaceholderType, cli EtcdClient, key string, rev int64) error {
 	var rch clientv3.WatchChan
 	if rev != 0 {
 		rch = cli.Watch(clientv3.WithRequireLeader(c.context(cli)), makeKeyPrefix(key), clientv3.WithPrefix(),
@@ -439,7 +583,7 @@ func (c *cluster) watchStream(cli EtcdClient, key string, rev int64) error {
 			}
 
 			c.handleWatchEvents(key, wresp.Events)
-		case <-c.done:
+		case <-done:
 			return nil
 		}
 	}

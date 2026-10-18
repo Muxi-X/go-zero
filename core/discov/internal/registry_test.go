@@ -180,7 +180,9 @@ func TestCluster_Load(t *testing.T) {
 	c := &cluster{
 		values: make(map[string]map[string]string),
 	}
-	c.load(cli, "any")
+	rev, err := c.load(nil, cli, "any")
+	assert.NoError(t, err)
+	assert.Equal(t, int64(0), rev)
 }
 
 func TestCluster_Watch(t *testing.T) {
@@ -224,7 +226,7 @@ func TestCluster_Watch(t *testing.T) {
 			listener.EXPECT().OnDelete(gomock.Any()).Do(func(_ interface{}) {
 				handled <- struct{}{}
 			}).MaxTimes(1)
-			go c.watch(cli, "any", 0)
+			go c.watch(c.done, cli, "any", 0)
 			ch <- clientv3.WatchResponse{
 				Events: []*clientv3.Event{
 					{
@@ -272,7 +274,7 @@ func TestClusterWatch_RespFailures(t *testing.T) {
 				ch <- resp
 				close(c.done)
 			}()
-			c.watch(cli, "any", 0)
+			c.watch(c.done, cli, "any", 0)
 		})
 	}
 }
@@ -292,7 +294,7 @@ func TestClusterWatch_CloseChan(t *testing.T) {
 		close(ch)
 		close(c.done)
 	}()
-	c.watch(cli, "any", 0)
+	c.watch(c.done, cli, "any", 0)
 }
 
 // TestClusterWatch_CompactedRevisionKeepsClient covers the shared-client
@@ -348,7 +350,7 @@ func TestClusterWatch_CompactedRevisionKeepsClient(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.watch(cli, "any", 10)
+		c.watch(c.done, cli, "any", 10)
 		close(done)
 	}()
 
@@ -470,7 +472,9 @@ func TestCluster_LoadOnClosedClientReturns(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.load(cli, "any")
+		rev, err := c.load(c.done, cli, "any")
+		assert.NoError(t, err)
+		assert.Equal(t, int64(0), rev)
 		close(done)
 	}()
 
@@ -572,7 +576,7 @@ func TestClusterWatch_RecreatedClientInvalidated(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		c.watch(deadCli, "any", 0)
+		c.watch(c.done, deadCli, "any", 0)
 		close(done)
 	}()
 
@@ -596,8 +600,9 @@ func TestClusterWatch_RecreatedClientInvalidated(t *testing.T) {
 // TestClusterWatch_DeadRecreatedClientRemoved covers the guard's recovery
 // path: when the recreated client has already been closed by another source,
 // watch() switches to it and invalidates it by identity on the next round.
-// Retrying with the previous client would never match the cached one, leaving
-// the dead client in the cache forever.
+// Retrying with the previous client would never match the client cached under
+// the cluster key, so the dead client would never be removed and every round
+// would only spend a cooldown before failing again.
 func TestClusterWatch_DeadRecreatedClientRemoved(t *testing.T) {
 	ctrl := gomock.NewController(t)
 	defer ctrl.Finish()
@@ -634,6 +639,7 @@ func TestClusterWatch_DeadRecreatedClientRemoved(t *testing.T) {
 	aliveCli := NewMockEtcdClient(ctrl)
 	aliveCli.EXPECT().Ctx().Return(aliveCtx).AnyTimes()
 	aliveCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	aliveCli.EXPECT().Close().Return(nil).AnyTimes()
 	aliveWatch := make(chan clientv3.WatchResponse)
 	aliveCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(aliveWatch).AnyTimes()
 
@@ -657,10 +663,13 @@ func TestClusterWatch_DeadRecreatedClientRemoved(t *testing.T) {
 	c.done = make(chan lang.PlaceholderType)
 	c.listeners = make(map[string][]UpdateListener)
 	c.values = make(map[string]map[string]string)
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, aliveCli)
+	}()
 
 	done := make(chan struct{})
 	go func() {
-		c.watch(firstCli, "any", 0)
+		c.watch(c.done, firstCli, "any", 0)
 		close(done)
 	}()
 
@@ -708,6 +717,7 @@ func TestClusterWatch_ConcurrentInvalidation(t *testing.T) {
 	aliveCli := NewMockEtcdClient(ctrl)
 	aliveCli.EXPECT().Ctx().Return(aliveCtx).AnyTimes()
 	aliveCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	aliveCli.EXPECT().Close().Return(nil).AnyTimes()
 	aliveWatch := make(chan clientv3.WatchResponse)
 	aliveCli.EXPECT().Watch(gomock.Any(), gomock.Any(), gomock.Any()).Return(aliveWatch).AnyTimes()
 
@@ -727,6 +737,9 @@ func TestClusterWatch_ConcurrentInvalidation(t *testing.T) {
 	c.done = make(chan lang.PlaceholderType)
 	c.listeners = make(map[string][]UpdateListener)
 	c.values = make(map[string]map[string]string)
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, aliveCli)
+	}()
 
 	// Cache the client the way monitor() does.
 	if _, err := c.getClient(); err != nil {
@@ -739,7 +752,7 @@ func TestClusterWatch_ConcurrentInvalidation(t *testing.T) {
 		key := fmt.Sprintf("key-%d", i)
 		go func() {
 			defer wg.Done()
-			c.watch(deadCli, key, 0)
+			c.watch(c.done, deadCli, key, 0)
 		}()
 	}
 
@@ -752,5 +765,284 @@ func TestClusterWatch_ConcurrentInvalidation(t *testing.T) {
 	}
 
 	close(c.done)
-	wg.Wait()
+	allDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(allDone)
+	}()
+
+	select {
+	case <-allDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watchers did not exit")
+	}
+}
+
+// TestCluster_ReloadDoesNotHoldLockWhileWaiting covers the reload deadlock:
+// reload used to keep c.lock while waiting for the watchers, which take the
+// same lock in handleChanges, so a watcher finishing its load blocked forever
+// and froze the whole cluster.
+func TestCluster_ReloadDoesNotHoldLockWhileWaiting(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	conn := createMockConn(t)
+	defer conn.Close()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	cli.EXPECT().Close().Return(nil).AnyTimes()
+
+	// Block the watcher's Get until reload has replaced the generation.
+	getEntered := make(chan struct{})
+	releaseGet := make(chan struct{})
+	cli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			select {
+			case <-getEntered:
+			default:
+				close(getEntered)
+			}
+			<-releaseGet
+			return &clientv3.GetResponse{Header: &etcdserverpb.ResponseHeader{}}, nil
+		}).AnyTimes()
+	// The watcher exits as soon as it sees the old generation closed.
+	cli.EXPECT().Watch(gomock.Any(), gomock.Any(), gomock.Any()).
+		Return(make(chan clientv3.WatchResponse)).AnyTimes()
+
+	restore := setMockClient(cli)
+	defer restore()
+
+	c := newCluster([]string{"reload-lock-" + stringx.Rand()})
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, cli)
+	}()
+
+	done := c.currentDone()
+	c.watchGroup.Run(func() {
+		rev, _ := c.load(done, cli, "any")
+		c.watch(done, cli, "any", rev)
+	})
+
+	select {
+	case <-getEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not reach load")
+	}
+
+	reloaded := make(chan struct{})
+	go func() {
+		c.reload()
+		close(reloaded)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reload did not replace the generation")
+	}
+
+	// The watcher can now reach handleChanges, which takes c.lock. reload must
+	// not be holding it while waiting for the watcher to exit.
+	close(releaseGet)
+
+	select {
+	case <-reloaded:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reload deadlocked waiting for the watcher")
+	}
+}
+
+// TestCluster_StartWatchOncePerGeneration covers the registration rule: a key
+// has exactly one watcher per generation, and a generation that has already
+// been replaced cannot be registered into.
+func TestCluster_StartWatchOncePerGeneration(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	// A second watcher for the same key would call Watch twice.
+	watchCalled := make(chan struct{}, 1)
+	cli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) clientv3.WatchChan {
+			watchCalled <- struct{}{}
+			return make(chan clientv3.WatchResponse)
+		}).Times(1)
+
+	c := newCluster([]string{"start-watch-" + stringx.Rand()})
+	done := c.currentDone()
+	defer close(done)
+
+	if !c.startWatch(done, cli, "any", 0) {
+		t.Fatal("first startWatch should start a watcher")
+	}
+
+	select {
+	case <-watchCalled:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not start")
+	}
+
+	if !c.startWatch(done, cli, "any", 0) {
+		t.Fatal("second startWatch should report the generation as current")
+	}
+
+	c.lock.Lock()
+	c.done = make(chan lang.PlaceholderType)
+	c.started = make(map[string]struct{})
+	c.lock.Unlock()
+
+	if c.startWatch(done, cli, "any", 0) {
+		t.Fatal("startWatch should reject a replaced generation")
+	}
+}
+
+// TestCluster_ReloadKeepsMonitoredKeys covers that a reload re-watches every
+// monitored key in the new generation.
+func TestCluster_ReloadKeepsMonitoredKeys(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	conn := createMockConn(t)
+	defer conn.Close()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	cli.EXPECT().Close().Return(nil).AnyTimes()
+
+	cli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(&clientv3.GetResponse{
+		Header: &etcdserverpb.ResponseHeader{},
+	}, nil).AnyTimes()
+	watched := make(chan struct{}, 4)
+	cli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) clientv3.WatchChan {
+			watched <- struct{}{}
+			return make(chan clientv3.WatchResponse)
+		}).AnyTimes()
+
+	restore := setMockClient(cli)
+	defer restore()
+
+	c := newCluster([]string{"reload-monitored-" + stringx.Rand()})
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, cli)
+	}()
+
+	listener := NewMockUpdateListener(ctrl)
+	assert.NoError(t, c.monitor("any", listener))
+
+	select {
+	case <-watched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor did not start a watcher")
+	}
+
+	c.reload()
+
+	select {
+	case <-watched:
+	case <-time.After(2 * time.Second):
+		t.Fatal("reload did not re-watch the monitored key")
+	}
+
+	close(c.currentDone())
+}
+
+// TestCluster_MonitorReturnsTerminalError covers that a Get failure that can
+// never succeed, e.g. a missing read permission, is reported to the subscriber
+// instead of retrying forever and leaving NewSubscriber stuck.
+func TestCluster_MonitorReturnsTerminalError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	conn := createMockConn(t)
+	defer conn.Close()
+	cli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	cli.EXPECT().Close().Return(nil).AnyTimes()
+
+	cli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(nil,
+		status.Error(codes.PermissionDenied, "etcdserver: permission denied")).Times(1)
+
+	restore := setMockClient(cli)
+	defer restore()
+
+	c := newCluster([]string{"terminal-" + stringx.Rand()})
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, cli)
+	}()
+
+	listener := NewMockUpdateListener(ctrl)
+	monitored := make(chan error, 1)
+	go func() {
+		monitored <- c.monitor("any", listener)
+	}()
+
+	select {
+	case err := <-monitored:
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "permission denied")
+	case <-time.After(2 * time.Second):
+		t.Fatal("monitor did not report the terminal error")
+	}
+
+	c.lock.Lock()
+	listeners := len(c.listeners["any"])
+	c.lock.Unlock()
+	assert.Equal(t, 0, listeners, "failed monitor must not leave an orphan listener")
+}
+
+// TestCluster_LoadInterruptsTransientRetries covers that a transient Get
+// failure is retried, and that a replaced generation interrupts the cooldown
+// instead of waiting it out.
+func TestCluster_LoadInterruptsTransientRetries(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	cli := NewMockEtcdClient(ctrl)
+	cli.EXPECT().Ctx().Return(context.Background()).AnyTimes()
+	attempted := make(chan struct{}, 4)
+	cli.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) (*clientv3.GetResponse, error) {
+			attempted <- struct{}{}
+			return nil, status.Error(codes.Unavailable, "etcdserver: no leader")
+		}).AnyTimes()
+
+	c := &cluster{
+		done:   make(chan lang.PlaceholderType),
+		values: make(map[string]map[string]string),
+	}
+
+	loaded := make(chan struct{})
+	go func() {
+		_, _ = c.load(c.done, cli, "any")
+		close(loaded)
+	}()
+
+	select {
+	case <-attempted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("load did not attempt a Get")
+	}
+
+	start := time.Now()
+	close(c.done)
+
+	select {
+	case <-loaded:
+		// A plain sleep would take the whole coolDownInterval.
+		assert.True(t, time.Since(start) < coolDownInterval/2, "load did not interrupt the cooldown")
+	case <-time.After(2 * time.Second):
+		t.Fatal("load did not stop after the generation was replaced")
+	}
 }
