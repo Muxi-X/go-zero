@@ -8,10 +8,13 @@ import (
 )
 
 func TestAccount(t *testing.T) {
+	// The accounts are stored globally, so the endpoints have to be unique for
+	// repeated runs (-count=N).
+	suffix := stringx.Rand()
 	endpoints := []string{
-		"192.168.0.2:2379",
-		"192.168.0.3:2379",
-		"192.168.0.4:2379",
+		"account-2-" + suffix + ":2379",
+		"account-3-" + suffix + ":2379",
+		"account-4-" + suffix + ":2379",
 	}
 	username := "foo" + stringx.Rand()
 	password := "bar"
