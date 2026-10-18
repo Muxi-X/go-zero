@@ -54,15 +54,7 @@ func (r *Registry) InvalidateConn(endpoints []string, cli EtcdClient) error {
 
 // Monitor monitors the key on given etcd endpoints, notify with the given UpdateListener.
 func (r *Registry) Monitor(endpoints []string, key string, l UpdateListener) error {
-	c, exists := r.getCluster(endpoints)
-	// if exists, the existing values should be updated to the listener.
-	if exists {
-		kvs := c.getCurrent(key)
-		for _, kv := range kvs {
-			l.OnAdd(kv)
-		}
-	}
-
+	c, _ := r.getCluster(endpoints)
 	return c.monitor(key, l)
 }
 
@@ -124,21 +116,6 @@ func (c *cluster) getClient() (EtcdClient, error) {
 	}
 
 	return val.(EtcdClient), nil
-}
-
-func (c *cluster) getCurrent(key string) []KV {
-	c.lock.Lock()
-	defer c.lock.Unlock()
-
-	var kvs []KV
-	for k, v := range c.values[key] {
-		kvs = append(kvs, KV{
-			Key: k,
-			Val: v,
-		})
-	}
-
-	return kvs
 }
 
 func (c *cluster) handleChanges(key string, kvs []KV) {
@@ -297,6 +274,35 @@ func (c *cluster) wait(done chan lang.PlaceholderType) bool {
 	}
 }
 
+// recreateClient replaces a failed client with a new one, cooling down between
+// attempts. It reports whether the watcher generation is still alive.
+func (c *cluster) recreateClient(done chan lang.PlaceholderType) (EtcdClient, bool) {
+	for {
+		if !c.wait(done) {
+			return nil, false
+		}
+
+		cli, err := c.getClient()
+		if err != nil {
+			logx.Errorf("recreate etcd client: %v", err)
+			continue
+		}
+		// The freshly created client may have been closed by another failing
+		// source racing with this recreation. Remove it by identity: the next
+		// round has to invalidate this very client, otherwise it would stay in
+		// the cache.
+		if cli.Ctx().Err() != nil {
+			logx.Errorf("etcd client invalidated during recreation, retry")
+			if rerr := connManager.RemoveResourceIf(c.key, cli); rerr != nil {
+				logx.Errorf("remove etcd client resource: %v", rerr)
+			}
+			continue
+		}
+
+		return cli, true
+	}
+}
+
 // isTerminalGetError reports whether a failed Get can never succeed by
 // retrying, e.g. when the credentials or the permissions are wrong. Transient
 // failures, such as an unavailable cluster, are retried.
@@ -319,9 +325,20 @@ func errorCode(err error) codes.Code {
 }
 
 func (c *cluster) monitor(key string, l UpdateListener) error {
-	c.lock.Lock()
-	c.listeners[key] = append(c.listeners[key], l)
-	c.lock.Unlock()
+	func() {
+		c.lock.Lock()
+		defer c.lock.Unlock()
+
+		c.listeners[key] = append(c.listeners[key], l)
+		// Replay the current values under the same lock that registers the
+		// listener: an event delivered between a snapshot taken here and a
+		// replay done afterwards could otherwise be overwritten by the older
+		// snapshot. Listeners must not call back into the registry (e.g.
+		// NewSubscriber) from OnAdd, or this deadlocks.
+		for k, v := range c.values[key] {
+			l.OnAdd(KV{Key: k, Val: v})
+		}
+	}()
 
 	cli, err := c.getClient()
 	if err != nil {
@@ -338,6 +355,14 @@ func (c *cluster) monitor(key string, l UpdateListener) error {
 		rev, err := c.load(done, cli, key)
 		if err != nil {
 			c.removeListener(key, l)
+			// Leave a fresh client behind for the next attempt: an
+			// authentication error means the cached one is unusable, and a
+			// retry with it would fail the same way.
+			if shouldInvalidateConn(cli, err) {
+				if rerr := connManager.RemoveResourceIf(c.key, cli); rerr != nil {
+					logx.Errorf("remove etcd client resource: %v", rerr)
+				}
+			}
 			return err
 		}
 
@@ -357,7 +382,12 @@ func (c *cluster) removeListener(key string, l UpdateListener) {
 	listeners := c.listeners[key]
 	for i, item := range listeners {
 		if item == l {
-			c.listeners[key] = append(listeners[:i], listeners[i+1:]...)
+			listeners = append(listeners[:i], listeners[i+1:]...)
+			if len(listeners) == 0 {
+				delete(c.listeners, key)
+			} else {
+				c.listeners[key] = listeners
+			}
 			return
 		}
 	}
@@ -442,10 +472,11 @@ func (c *cluster) reload() {
 	for _, key := range keys {
 		k := key
 		group.Run(func() {
+			client := cli
 			for {
-				rev, err := c.load(done, cli, k)
+				rev, err := c.load(done, client, k)
 				if err == nil {
-					c.watch(done, cli, k, rev)
+					c.watch(done, client, k, rev)
 					return
 				}
 
@@ -453,9 +484,24 @@ func (c *cluster) reload() {
 				// 0 after the error is cleared would skip every change made
 				// while it persisted.
 				logx.Error(err)
-				if !c.wait(done) {
+				// An authentication error means the cached client is unusable:
+				// retrying the load with it would fail the same way, leaving
+				// the key stale forever.
+				if !shouldInvalidateConn(client, err) {
+					if !c.wait(done) {
+						return
+					}
+					continue
+				}
+
+				if rerr := connManager.RemoveResourceIf(c.key, client); rerr != nil {
+					logx.Errorf("remove etcd client resource: %v", rerr)
+				}
+				newCli, ok := c.recreateClient(done)
+				if !ok {
 					return
 				}
+				client = newCli
 			}
 		})
 	}
@@ -493,34 +539,20 @@ func (c *cluster) watch(done chan lang.PlaceholderType, cli EtcdClient, key stri
 		// replaced the cached client, and closing that fresh client would
 		// disrupt it for no reason. Single-flight guarantees only one client
 		// is recreated even when multiple watchers fail together.
-		invalidate := shouldInvalidateConn(cli, err)
-		if invalidate {
+		if shouldInvalidateConn(cli, err) {
 			if err := connManager.RemoveResourceIf(c.key, cli); err != nil {
 				logx.Errorf("remove etcd client resource: %v", err)
 			}
-		}
 
-		// Retry with a cooldown to avoid a tight loop.
-		if !c.wait(done) {
-			return
-		}
-
-		if invalidate {
-			newCli, err := c.getClient()
-			if err != nil {
-				logx.Errorf("recreate etcd client: %v", err)
-				continue
+			newCli, ok := c.recreateClient(done)
+			if !ok {
+				return
 			}
-			// Switch to the new client before checking it: if it has been
-			// closed by another failing source (e.g. a concurrent watcher or
-			// the publisher's InvalidateConn) racing with this recreation, the
-			// next round has to invalidate this very client by identity.
-			// Retrying with the previous client would never match the cached
-			// one, leaving the dead client in the cache.
 			cli = newCli
-			if newCli.Ctx().Err() != nil {
-				logx.Errorf("etcd client invalidated during recreation, retry")
-				continue
+		} else {
+			// Retry with a cooldown to avoid a tight loop.
+			if !c.wait(done) {
+				return
 			}
 		}
 
@@ -555,18 +587,32 @@ func shouldInvalidateConn(cli EtcdClient, err error) bool {
 // accepted by the server. clientv3 refreshes the token for the same set of
 // errors in Client.shouldRefreshToken.
 func isAuthError(err error) bool {
+	// Watch errors are normalized by clientv3 into rpctypes values, while a
+	// failed unary call returns the raw gRPC status error.
+	if errorCode(err) == codes.Unauthenticated {
+		return true
+	}
+
+	err = rpctypes.Error(err)
 	return errors.Is(err, rpctypes.ErrInvalidAuthToken) ||
 		errors.Is(err, rpctypes.ErrAuthOldRevision) ||
 		errors.Is(err, rpctypes.ErrUserEmpty)
 }
 
 func (c *cluster) watchStream(done chan lang.PlaceholderType, cli EtcdClient, key string, rev int64) error {
+	// Cancel the watch when this stream is no longer consumed. Otherwise
+	// clientv3 keeps the substream attached to the shared client: its one-slot
+	// response buffer fills, then the client's dispatch loop blocks on it and
+	// every other watch on the same endpoints stops receiving events.
+	ctx, cancel := context.WithCancel(c.context(cli))
+	defer cancel()
+
 	var rch clientv3.WatchChan
 	if rev != 0 {
-		rch = cli.Watch(clientv3.WithRequireLeader(c.context(cli)), makeKeyPrefix(key), clientv3.WithPrefix(),
+		rch = cli.Watch(clientv3.WithRequireLeader(ctx), makeKeyPrefix(key), clientv3.WithPrefix(),
 			clientv3.WithRev(rev+1))
 	} else {
-		rch = cli.Watch(clientv3.WithRequireLeader(c.context(cli)), makeKeyPrefix(key), clientv3.WithPrefix())
+		rch = cli.Watch(clientv3.WithRequireLeader(ctx), makeKeyPrefix(key), clientv3.WithPrefix())
 	}
 
 	for {
