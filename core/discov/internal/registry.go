@@ -618,6 +618,22 @@ func (c *cluster) watch(done chan lang.PlaceholderType, cli EtcdClient, key stri
 			// Keep the last good revision. Watching from 0 after the error is
 			// cleared would silently skip every change made during the outage.
 			logx.Error(err)
+			// The watch that brought us here may have failed for another
+			// reason (e.g. a compacted revision) while the token expired, so
+			// the client can be unusable even though the watch error was not
+			// an auth error. Replace it, otherwise the loop would keep
+			// retrying the same rejected client.
+			if shouldInvalidateConn(cli, err) {
+				if rerr := connManager.RemoveResourceIf(c.key, cli); rerr != nil {
+					logx.Errorf("remove etcd client resource: %v", rerr)
+				}
+				newCli, ok := c.recreateClient(done)
+				if !ok {
+					return
+				}
+				cli = newCli
+				continue
+			}
 			if !c.wait(done) {
 				return
 			}

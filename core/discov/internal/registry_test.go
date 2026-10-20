@@ -1329,10 +1329,21 @@ func TestCluster_MonitorReplaysCurrentValues(t *testing.T) {
 	}
 
 	// The replay must run under the registry lock, otherwise a concurrent
-	// event could be delivered before the snapshot it supersedes.
-	if c.lock.TryLock() {
+	// event could be delivered before the snapshot it supersedes. Probing with
+	// a blocking Lock keeps the test compatible with the Go version declared
+	// in go.mod (sync.Mutex.TryLock needs Go 1.18).
+	acquired := make(chan struct{})
+	go func() {
+		c.lock.Lock()
+		close(acquired)
 		c.lock.Unlock()
+	}()
+
+	select {
+	case <-acquired:
+		close(release)
 		t.Fatal("initial values were replayed without holding the registry lock")
+	case <-time.After(500 * time.Millisecond):
 	}
 
 	close(release)
@@ -1654,4 +1665,73 @@ func TestCluster_ReloadRecreatesClientAfterFailure(t *testing.T) {
 	}
 
 	close(c.currentDone())
+}
+
+// TestCluster_WatchInvalidatesClientOnLoadAuthError covers that an auth error
+// returned by the load that follows a non-auth watch failure still replaces the
+// client; otherwise the loop would keep retrying the rejected client.
+func TestCluster_WatchInvalidatesClientOnLoadAuthError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	defer ctrl.Finish()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	conn := createMockConn(t)
+	defer conn.Close()
+
+	deadCli := NewMockEtcdClient(ctrl)
+	deadCli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	deadCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	deadCli.EXPECT().Close().Return(nil).Times(1)
+	compacted := make(chan clientv3.WatchResponse, 1)
+	compacted <- clientv3.WatchResponse{Canceled: true, CompactRevision: 1}
+	deadCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).Return(compacted).AnyTimes()
+	deadCli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(nil,
+		status.Error(codes.Unauthenticated, "etcdserver: invalid auth token")).AnyTimes()
+
+	freshCli := NewMockEtcdClient(ctrl)
+	freshCli.EXPECT().Ctx().Return(ctx).AnyTimes()
+	freshCli.EXPECT().ActiveConnection().Return(conn).AnyTimes()
+	freshCli.EXPECT().Close().Return(nil).AnyTimes()
+	freshCli.EXPECT().Get(gomock.Any(), "any/", gomock.Any()).Return(&clientv3.GetResponse{
+		Header: &etcdserverpb.ResponseHeader{},
+	}, nil).AnyTimes()
+	watched := make(chan struct{}, 1)
+	freshCli.EXPECT().Watch(gomock.Any(), "any/", gomock.Any()).DoAndReturn(
+		func(context.Context, string, ...clientv3.OpOption) clientv3.WatchChan {
+			watched <- struct{}{}
+			return make(chan clientv3.WatchResponse)
+		}).AnyTimes()
+
+	restore := setMockClients(deadCli, freshCli)
+	defer restore()
+
+	c := newCluster([]string{"load-auth-" + stringx.Rand()})
+	defer func() {
+		_ = connManager.RemoveResourceIf(c.key, freshCli)
+	}()
+
+	// Cache the failed client the way monitor() does.
+	if _, err := c.getClient(); err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		c.watch(c.done, deadCli, "any", 0)
+		close(done)
+	}()
+
+	select {
+	case <-watched:
+	case <-time.After(6 * time.Second):
+		t.Fatal("watch did not replace the client after the load auth error")
+	}
+
+	close(c.done)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watch did not exit")
+	}
 }
