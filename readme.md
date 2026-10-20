@@ -51,8 +51,8 @@ replace github.com/zeromicro/go-zero => github.com/Muxi-X/go-zero v1.4.5-muxi.9
 ```bash
 # 改代码 -> commit 到 muxi-patch
 # 发版 -> 打新 tag（递增），不覆盖：
-git tag v1.4.5-muxi.9   # 下一次
-git push origin v1.4.5-muxi.9
+git tag v1.4.5-muxi.10   # 下一次
+git push origin v1.4.5-muxi.10
 # 项目 go.mod replace 更新到新 tag
 ```
 
